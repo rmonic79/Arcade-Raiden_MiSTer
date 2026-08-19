@@ -82,8 +82,8 @@ module Raiden_sprite_renderer (
 	// Layout 10-bit: [9:6]=color (4-bit MAME Raiden), [5:4]=pri_code, [3:0]=pen
 	// Valid pixel = pen != 0xF (15 = trasparente in MAME)
 	localparam [9:0] LB_EMPTY = 10'h00F;     // color=0, pri=0, pen=15 (trasparente)
-	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf0 [0:319];
-	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf1 [0:319];
+	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf0 [0:511];
+	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf1 [0:511];
 	reg        active_buf;
 
 	// ─── Sprite scan FSM ─────────────────────────────────────────────────────
@@ -415,9 +415,17 @@ module Raiden_sprite_renderer (
 		end
 	end
 
-	// ─── Read side combinatoriale ────────────────────────────────────────────
+	// ─── Read side (registrata M10K + lookahead 1 = latenza netta 0) ─────────
+	// Legge hpos+1: dato registrato per hpos pronto al display. Bordo pixel-0 primato
+	// dai 48 cicli hblank; active_buf stabile nel visibile. Behavior-preserving.
 	// Layout linebuf: [9:6]=color (4-bit), [5:4]=pri, [3:0]=pen
-	wire  [9:0] read_data = active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
+	wire [8:0] rd_addr = hpos[8:0] + 9'd1;
+	reg [9:0] lb0_q, lb1_q;
+	always @(posedge clk) if (ce_pix) begin
+		lb0_q <= linebuf0[rd_addr];
+		lb1_q <= linebuf1[rd_addr];
+	end
+	wire  [9:0] read_data = active_buf ? lb1_q : lb0_q;
 	wire  [3:0] read_pen   = read_data[3:0];
 	wire  [1:0] read_pri   = read_data[5:4];
 	wire  [3:0] read_color = read_data[9:6];
@@ -427,5 +435,29 @@ module Raiden_sprite_renderer (
 	assign opaque    = pixel_active;
 	assign pen_index = pixel_active ? (11'h200 + {3'd0, read_color, read_pen}) : 11'd0;
 	assign pri_code  = pixel_active ? read_pri : 2'd0;
+
+`ifdef V30_SIM_PROBES
+// Probe taglio sprite: righe in cui lo scan NON completa la lista entry
+// prima del new_line (= sprite successivi non disegnati su quella riga).
+integer spr_cut_n = 0;
+always @(posedge clk) begin
+	if (new_line && sc_state != SC_DONE && sc_state != SC_IDLE && spr_cut_n < 60) begin
+		spr_cut_n <= spr_cut_n + 1;
+		$display("[sprcut] vpos=%0d scan INCOMPLETO: state=%0d entry=%0d", vpos, sc_state, entry_idx);
+	end
+end
+
+// Probe PRIORITA': dump entry attive su UNA riga scelta (vpos==dbg_row), con
+// pri grezza da w2. Distingue "pri=0 dal gioco" da "pri corrotta dal buffer".
+integer spr_dump_n = 0;
+reg [8:0] dbg_row = 9'd120;
+always @(posedge clk) begin
+	if (sc_state == SC_CHECK && vpos == dbg_row && sp_enable && spr_dump_n < 40) begin
+		spr_dump_n <= spr_dump_n + 1;
+		$display("[sprpri] e%0d pri=%0d y=%0d x=%0d code=%0h col=%0d w0=%04h w2=%04h",
+		         entry_idx, sp_w2[15:14], sp_w0[7:0], sp_w2[8:0], sp_w1[11:0], sp_w0[11:8], sp_w0, sp_w2);
+	end
+end
+`endif
 
 endmodule

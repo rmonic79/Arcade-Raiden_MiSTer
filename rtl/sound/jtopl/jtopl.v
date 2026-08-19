@@ -29,6 +29,9 @@ module jtopl(
     input                  wr_n,
     output          [ 7:0] dout,
     output                 irq_n,
+    // per-channel volume (Q4.4, 0x10=1.0x)
+    input           [ 7:0] fmvol0, fmvol1, fmvol2, fmvol3, fmvol4,
+    input           [ 7:0] fmvol5, fmvol6, fmvol7, fmvol8,
     // combined output
     output  signed  [15:0] snd,
     output                 sample
@@ -248,6 +251,8 @@ jtopl_acc u_acc(
     .op_result  ( op_result     ),
     .op         ( op_out        ),
     .con        ( con_out       ),
+    .fmvol0(fmvol0), .fmvol1(fmvol1), .fmvol2(fmvol2), .fmvol3(fmvol3), .fmvol4(fmvol4),
+    .fmvol5(fmvol5), .fmvol6(fmvol6), .fmvol7(fmvol7), .fmvol8(fmvol8),
     .snd        ( snd           )
 );
 

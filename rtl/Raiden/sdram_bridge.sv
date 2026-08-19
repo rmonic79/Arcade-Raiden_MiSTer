@@ -17,6 +17,7 @@
     along with Raiden_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
 
     Author: Umberto Parisi (rmonic79)
+    Version: 1.0
     Date: 2026
 
 */

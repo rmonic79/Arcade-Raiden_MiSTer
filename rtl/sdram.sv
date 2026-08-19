@@ -86,13 +86,13 @@ localparam NO_WRITE_BURST = 1'd1; // 0=write burst enabled, 1=only single access
 
 localparam MODE = { 3'b000, NO_WRITE_BURST, OP_MODE, CAS_LATENCY, ACCESS_TYPE, BURST_LENGTH}; 
 
-localparam STATE_IDLE  = 3'd0;             // state to check the requests
-localparam STATE_START = STATE_IDLE+1'd1;  // state in which a new command is started
-localparam STATE_CONT  = STATE_START+RASCAS_DELAY;
-localparam STATE_READY = STATE_CONT+CAS_LATENCY+1'd1;
+localparam [3:0] STATE_IDLE  = 4'd0;             // state to check the requests
+localparam [3:0] STATE_START = STATE_IDLE+4'd1;  // state in which a new command is started
+localparam [3:0] STATE_CONT  = STATE_START+RASCAS_DELAY;
+localparam [3:0] STATE_READY = STATE_CONT+CAS_LATENCY+4'd1;
 localparam STATE_LAST  = STATE_READY;      // last state in cycle
 
-reg  [2:0] state = 0;
+reg  [3:0] state = 0;
 reg [22:1] a;
 reg [15:0] data;
 reg        we;
@@ -211,7 +211,11 @@ always @(posedge clk) begin
 			end
 
 			2'd2: begin
-				// MODE 2: CPU first — ports 1,2 priority, then port 0, port 3 last
+				// MODE 2: CPU first — ports 1,2 priority, then port 0, port 3 last.
+				// Le collisioni main/sub sono eliminate a monte: i ce dei due V30
+				// sono sfasati di 4 clk (PHASE_INIT in raiden_ce_gen) -> richieste
+				// mai nello stesso slot -> attesa max = residuo txn video (<=7)
+				// + propria (7) = <=16 clk = 0 wait per entrambe le CPU.
 				if (p1) begin
 					{ba,a} <= addr1; data <= din1; we <= wr[1]; dqm <= wr[1] ? ~{wrh1,wrl1} : 2'b00; ram_req[1] <= 1;
 					granted = 1;
@@ -279,7 +283,7 @@ always @(posedge clk) begin
 	end
 
 	if(mode != MODE_NORMAL || state != STATE_IDLE || reset) begin
-		state <= state + 1'd1;
+		state <= state + 4'd1;
 		if(state == STATE_LAST) state <= STATE_IDLE;
 	end
 end
@@ -317,6 +321,7 @@ localparam CMD_LOAD_MODE       = 3'b000;
 reg [15:0] sdram_dq_out;
 reg        sdram_dq_oe;
 assign SDRAM_DQ = sdram_dq_oe ? sdram_dq_out : 16'hZZZZ;
+
 
 always @(posedge clk) begin
 	if(state == STATE_START) SDRAM_BA <= (mode == MODE_NORMAL) ? ba : 2'b00;

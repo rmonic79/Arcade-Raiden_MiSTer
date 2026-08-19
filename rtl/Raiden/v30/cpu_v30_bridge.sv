@@ -2,38 +2,42 @@
 // Copyright (c) Umberto Parisi (rmonic79). GPL v3 or later.
 //
 //============================================================================
-// cpu_v30_bridge — wrapper SystemVerilog attorno all'entity VHDL `cpu`
-// (V30 NEC, sorgente: MiSTer-devel/WonderSwan_MiSTer rtl/cpu.vhd VHDL-2008).
+// cpu_v30_bridge — wrapper attorno al core V30 cycle-accurate (wickerwaka,
+// da Arcade-IremM72) tramite l'adapter `v30_bus` (bus muxato max-mode →
+// bus lean word-aligned). Sostituisce il vecchio core VHDL WonderSwan cpu.vhd.
 //
-// Scopo: esporre un'interfaccia bus pulita stile arcade-MiSTer
-//   addr [19:0] / din [15:0] / dout [15:0] / rd / wr / be [1:0] / d_io / ack
-// nascondendo:
-//   - savestate signals (tied off)
-//   - DMA hooks (tied off)
-//   - register bus debug (tied off)
-//   - turbo / SLOWTIMING flags (0)
+// La PORT-LIST ESTERNA resta identica: i due top (main/sub) istanziano il
+// bridge senza modifiche.
 //
-// Note V30 / Raiden:
-//   * Raiden V30 main @ 10 MHz, sub @ 10 MHz. ce 1 ogni N clk_sys.
-//   * IRQ vectored: irqrequest_in alto, irqvector_in[9:0] = vector da hw
-//     (Raiden non usa PIC 8259 esterno: vettore di IRQ4 lo fornisce direttamente).
-//   * Bus 20-bit byte address, ma il core esporta `bus_addr unsigned(19 downto 0)`
-//     allineato byte. data_m_be[1:0] = byte enable per accessi 8/16-bit.
-//   * `d_io` non presente nel core WonderSwan (sintetizzato dal microcode interno).
-//     L'I/O port instructions usano lo stesso bus_read/bus_write con flag
-//     interno: in WonderSwan il decoding I/O è demandato al system-on-chip.
-//     Per Raiden la mappa è memory-mapped quindi non usiamo distinzione.
+// Clocking:
+//   * ce      = avanzamento T-state (10 MHz = 1 pulse ogni 8 clk_sys).
+//   * ce_half = ce ritardato 1 fabric clock (latch indirizzo T1, come m72.v:
+//               count[0] alterna CE/CE_HALF → CE_HALF è l'emit successivo, +1 clk;
+//               con la ce /8 fissa di Raiden il ritardo registrato è esatto).
+//   * ce_4x   = NON più usato (il core nuovo non ha microcode-tick esterno).
+//   * READY tied high: nessun Tw. Gli stall ROM/SDRAM restano gestiti a monte
+//     dal CE-freeze di raiden_ce_gen (che toglie ce → e quindi ce_half al clk dopo).
 //
-// CE clock enable: per girare V30 a 10 MHz su clk_sys @ 60 MHz
-//   ce 1 ogni 6 clk_sys. ce_4x ogni 1.5 cicli (non integer): per ora
-//   ce_4x = ce per semplicità. WonderSwan usa ce_4x per la prefetch.
+// Byte lane M72-native: cpu_be[0]=lane bassa (A0==0), cpu_be[1]=lane alta
+//   (~UBE_N); cpu_dout/cpu_din sono già sulla lane corretta → i moduli
+//   downstream usano cpu_be[0]/[1] diretti e NON applicano byte_align.
+//
+// IRQ: il core nuovo vuole il NUMERO di vettore (lo moltiplica ×4 internamente).
+//   irq_vector[9:0] è l'indirizzo byte IVT (0x0C8) → numero = >>2 = 0x32.
+//   int_req è un livello; il top azzera irq_pending quando vede int_ack
+//   (esposto qui su cpu_irqrequest, invariato lato top).
+//
+// Savestate: regfile nativo 202-entry del core, esposto via v30_bus.ssbus,
+//   legato direttamente alla porta ss del sistema (SS_IDX). ss_cpu_reload →
+//   ss_restore_done (riporta l'adapter a bus-idle a load completato).
 //============================================================================
 
 module cpu_v30_bridge #(parameter SS_IDX = -1) (
 	input  logic        clk,
-	input  logic        ce,        // ~10 MHz: 1 ogni N clk_sys (gestito dal padre)
-	input  logic        ce_4x,     // 4× ce; se non disponibile collegare a ce
+	input  logic        ce,        // ~10 MHz: 1 ogni 8 clk (T-state advance)
+	input  logic        ce_4x,     // legacy: non usato dal core nuovo
 	input  logic        reset,
+	input  logic        rom_wait,  // alto durante fetch ROM/SDRAM (main/sub_rq_active)
 
 	// Bus dati/istruzioni unificato (V30 ha bus singolo)
 	output logic [19:0] bus_addr,
@@ -47,140 +51,96 @@ module cpu_v30_bridge #(parameter SS_IDX = -1) (
 	input  logic        irq_req,
 	input  logic  [9:0] irq_vector,
 
-	// Status / debug (opzionali, possono restare floating)
+	// Status / debug (i top lasciano halt/prefix scollegati)
 	output logic        cpu_idle,
 	output logic        cpu_halt,
 	output logic        cpu_irqrequest,
 	output logic        cpu_prefix,
 
-	// Savestate: slave del bus savestate del sistema (bridge SS interno)
+	// Savestate: slave del bus savestate del sistema (regfile nativo del core)
 	ssbus_if.slave      ss,
-	// reset CPU coordinato dal manager (post-load, a RAM tutte coerenti)
+	// pulse post-load dal manager → riporta l'adapter bus a idle
 	input  logic        ss_cpu_reload
 );
 
-	// FIX BYTE READ ALIGNMENT (V30 + word-aligned ROM/RAM bus):
-	// sub_top fornisce sempre il word completo a indirizzo pari (forza addr aligned).
-	// Quando V30 fa READ a addr dispari, cpu.vhd legge bus_dataread[7:0]
-	// aspettandosi il byte ALTO del word (= byte a addr odd), ma il byte voluto
-	// sta su bus_din[15:8]. Lo swap fornisce il byte corretto.
-	// NB: include sia byte read (bus_be=01) sia il primo accesso di word unaligned;
-	// in quest'ultimo caso cpu.vhd usa solo i bit [7:0], quindi distorto ma poi
-	// fa second access a addr+1 (pari, no swap) e ricostruisce il word.
-	// In pratica swap su qualsiasi read con bus_addr[0]=1.
-	// V30 byte alignment fixed in sub_top/main_top (cpu_din già allineato al
-	// byte richiesto secondo bus_addr[0]). Bridge passa bus_din invariato.
-	wire [15:0] bus_din_to_cpu = bus_din;
+	// ce_half = ce ritardato 1 clk. Se raiden_ce_gen toglie ce (stall ROM/SDRAM),
+	// al clk successivo ce_half va a 0 → entrambi i fasi congelati insieme.
+	// CE_HALF a +2 clk da CE (era +1). MOTIVO (misurato con STA 2026-08-14):
+	// l'upstream genera CE_HALF a META' PERIODO CPU (nec_bus: tick_fall =
+	// div_cnt == half-1), quindi il suo multicycle 2 sull'arco ce->ce_half e'
+	// vero con margine. Con CE_HALF a +1 clk quel vincolo era FALSO da noi:
+	// l'arco ha 1 solo periodo mentre l'SDC ne dichiarava 2 -> STA verde
+	// (+1.184) e SILICIO CHE VIOLA di -11.316 ns. E' lo STESSO meccanismo del
+	// bug punteggio storico (multicycle 9 falso, -11.03/-11.85 -> score x100).
+	// A +2 clk l'arco ha davvero 2 periodi -> il vincolo diventa VERO e lo
+	// slack misurato (+1.18) e' reale. CE_GAP_MIN=5 in raiden_ce_gen tiene
+	// vero anche l'arco di ritorno ce_half->ce (>=3 periodi).
+	reg ce_half_d1, ce_half;
+	always @(posedge clk) begin
+		ce_half_d1 <= ce;
+		ce_half    <= ce_half_d1;
+	end
 
-	// ─── Tied-off signals (M72 cpu.vhd port set) ────────────────────────────
-	wire        sleep_savestate = 1'b0;
-	wire        load_savestate  = 1'b0;
-	wire        turbo           = 1'b0;
-	wire        SLOWTIMING      = 1'b0;
+	// READY/Tw per ROM: durante il fetch (rom_wait) READY basso → il BIU inserisce
+	// Tw sul suo ciclo di bus ma l'EU CONTINUA dalla coda (overlap = V30 reale).
+	// Lag conservativo 2 clk dopo la fine fetch: garantisce il dato ROM stabile su
+	// AD (rdata_q, 1 clk) prima del campionamento del BIU (no race). ce non è più
+	// congelato (raiden_ce_gen stall=0) → l'EU gira durante il wait.
+	// READY FISSO ALTO (via libera utente 2026-08-13): i wait SDRAM sono
+	// gestiti dal CE-stall in raiden_ce_gen (contratto ucore: il BIU campiona
+	// il dato a T2, quindi il ciclo non deve AVANZARE finche' il dato non e'
+	// pronto — F57 v30u_biu + report M72 "an SDRAM stall defers CPU cycles").
+	// READY/Tw resta solo come meccanismo del rig upstream (wait artificiali
+	// a dato gia' presente), mai per latenza reale. rom_wait qui non serve piu'.
+	wire cpu_ready = 1'b1;
 
-	// SSBUS savestate registers — larghezze ESATTE da pacchetto VHDL
-	// (rtl/Raiden/v30/bus_savestates.vhd):
-	//   SSBUS_buswidth = 64
-	//   SSBUS_busadr   = 7
-	//
-	// IMPORTANTE: il V30 al reset interno legge SS_CPU1..4 dai defval del
-	// pacchetto reg_savestates.vhd:
-	//   CPU3.defval = 0x0000FFFF00000000 → reg_cs = 0xFFFF (V30 reset vector)
-	// Ma `Dout_buffer` di eReg_SS si reset a defval SOLO su BUS_rst=1.
-	// Quindi dobbiamo pulsare SSBUS_rst durante il reset esterno per riportare
-	// i registri ai defval, altrimenti partono con CS=0x0000 (post power-on
-	// è ok via initial, ma se non rilancio sim/FPGA dopo cambio core resta).
-	// SSBUS pilotato dal bridge savestate interno (raiden_v30_ss).
-	wire [63:0] SSBUS_Din;
-	wire  [6:0] SSBUS_Adr;
-	wire        SSBUS_wren;
-	wire [63:0] SSBUS_Dout;
-	wire        ss_reset;   // pulse post-load
-	// SSBUS_rst ricarica i DEFVAL: solo al power-on reset, NON al load (dove i
-	// registri SS sono stati appena scritti coi valori salvati e vanno tenuti).
-	wire        SSBUS_rst  = reset & ~ss_reset;
-	// Reset CPU = reset esterno OPPURE ss_reset (post-load): fa ricaricare reg_ip/ax/...
-	// da SS_CPU1..4 (cpu.vhd riga 577: on reset regs <= SS_CPU).
-	wire        cpu_reset  = reset | ss_reset;
+	// Strobe separati mem/io del core → bus unico (Raiden è tutto memory-mapped;
+	// io_rd/io_wr non dovrebbero attivarsi, OR difensivo).
+	wire mem_rd, io_rd, mem_wr, io_wr, code_fetch;
+	assign bus_read  = mem_rd | io_rd;
+	assign bus_write = mem_wr | io_wr;
 
-	raiden_v30_ss #(.SS_IDX(SS_IDX)) u_ss (
-		.clk         (clk),
-		.reset       (reset),
-		.ss_cpu_reload(ss_cpu_reload),
-		.ssbus_din   (SSBUS_Din),
-		.ssbus_adr   (SSBUS_Adr),
-		.ssbus_wren  (SSBUS_wren),
-		.ssbus_dout  (SSBUS_Dout),
-		.ss_reset_cpu(ss_reset),
-		.ss          (ss)
-	);
+	// INTA acknowledge del core → il top lo usa (come cpu_irqrequest) per azzerare
+	// il proprio latch irq_pending.
+	wire int_ack;
+	assign cpu_irqrequest = int_ack;
 
-	// Register bus debug (dummy)
-	// pRegisterBus: BUS_buswidth=8, BUS_busadr=8 (verifica con package)
-	wire  [7:0] RegBus_Din_unused;
-	wire  [7:0] RegBus_Adr_unused;
-	wire        RegBus_wren_unused;
-	wire        RegBus_rden_unused;
-	wire  [7:0] RegBus_Dout = 8'd0;
+	// cpu_idle = ss_quiet (BIU bus-quiet = punto sicuro di cattura SS), registrato.
+	wire ss_quiet;
+	reg  cpu_idle_r;
+	always @(posedge clk) cpu_idle_r <= ss_quiet;
+	assign cpu_idle   = cpu_idle_r;
 
-	// cpu_export (record VHDL pexport): non usabile da Verilog senza wrapper
-	// dedicato. Il VHDL `cpu` lo dichiara come output `cpu_export : out cpu_export_type`.
-	// Soluzione: NON connettere — Quartus permette output VHDL non collegati.
-	// In SystemVerilog non possiamo dichiarare un wire del tipo record.
-	// Workaround: l'istanza qui sotto LASCIA cpu_export floating.
-	// (Se Quartus si lamenta serve un piccolo wrapper VHDL intermedio.)
+	assign cpu_halt   = 1'b0;         // non esposto dal core nuovo; i top non lo usano
+	assign cpu_prefix = code_fetch;   // prefetch marker; i top non lo usano
 
-	// Output unused (M72 port)
-	wire        cpu_done_unused;
-	wire        irqrequest_ack_unused;
-	wire  [7:0] cpu_export_opcode_unused;
-	wire [15:0] cpu_export_reg_cs_unused;
-	wire [15:0] cpu_export_reg_ip_unused;
+	v30_bus #(.SS_IDX(SS_IDX)) u_core (
+		.clk            (clk),
+		.ce             (ce),
+		.ce_half        (ce_half),
+		.reset          (reset),           // active high
+		.ready          (cpu_ready),       // Tw durante fetch ROM (l'EU overlappa); 1 sulle region on-chip
 
-	// ─── Istanza VHDL cpu (M72 port set) ────────────────────────────────────
-	cpu u_cpu (
-		.clk               (clk),
-		.ce                (ce),
-		.ce_4x             (ce_4x),
-		.reset             (cpu_reset),
-		.turbo             (turbo),
-		.SLOWTIMING        (SLOWTIMING),
+		.cpu_addr       (bus_addr),        // bit0 già forzato 0 dal core
+		.cpu_be         (bus_be),          // [0]=lane bassa (A0==0), [1]=lane alta (~UBE_N)
+		.cpu_dout       (bus_dout),
+		.cpu_din        (bus_din),
 
-		.cpu_idle          (cpu_idle),
-		.cpu_halt          (cpu_halt),
-		.cpu_irqrequest    (cpu_irqrequest),
-		.cpu_prefix        (cpu_prefix),
+		.mem_rd         (mem_rd),
+		.io_rd          (io_rd),
+		.mem_wr         (mem_wr),
+		.io_wr          (io_wr),
+		.code_fetch     (code_fetch),
 
-		.bus_read          (bus_read),
-		.bus_write         (bus_write),
-		.bus_be            (bus_be),
-		.bus_addr          (bus_addr),
-		.bus_datawrite     (bus_dout),
-		.bus_dataread      (bus_din_to_cpu),
+		.int_req        (irq_req),
+		.int_vector     (irq_vector[9:2]), // 0x0C8 → 0x32 (numero vettore)
+		.int_ack        (int_ack),
 
-		.irqrequest_in     (irq_req),
-		.irqvector_in      (irq_vector),
-		.irqrequest_ack    (irqrequest_ack_unused),
+		.dbg_regs       (),                // solo sim (V30_BACKDOOR)
 
-		.load_savestate    (load_savestate),
-
-		.cpu_done          (cpu_done_unused),
-		.cpu_export_opcode (cpu_export_opcode_unused),
-		.cpu_export_reg_cs (cpu_export_reg_cs_unused),
-		.cpu_export_reg_ip (cpu_export_reg_ip_unused),
-
-		.RegBus_Din        (RegBus_Din_unused),
-		.RegBus_Adr        (RegBus_Adr_unused),
-		.RegBus_wren       (RegBus_wren_unused),
-		.RegBus_rden       (RegBus_rden_unused),
-		.RegBus_Dout       (RegBus_Dout),
-
-		.sleep_savestate   (sleep_savestate),
-		.SSBUS_Din         (SSBUS_Din),
-		.SSBUS_Adr         (SSBUS_Adr),
-		.SSBUS_wren        (SSBUS_wren),
-		.SSBUS_rst         (SSBUS_rst),
-		.SSBUS_Dout        (SSBUS_Dout)
+		.ssbus          (ss),
+		.ss_restore_done(ss_cpu_reload),
+		.ss_quiet       (ss_quiet)
 	);
 
 endmodule

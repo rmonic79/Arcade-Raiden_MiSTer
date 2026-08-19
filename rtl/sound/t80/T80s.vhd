@@ -96,7 +96,9 @@ entity T80s is
 		A       : out std_logic_vector(15 downto 0);
 		DI      : in std_logic_vector(7 downto 0);
 		DO      : out std_logic_vector(7 downto 0);
-		REG     : out std_logic_vector(211 downto 0)
+		REG     : out std_logic_vector(211 downto 0);
+		DIRSet  : in  std_logic := '0';
+		DIR     : in  std_logic_vector(211 downto 0) := (others => '0')
 	);
 end T80s;
 
@@ -183,7 +185,9 @@ begin
 		TS => TState,
 		OUT0 => OUT0,
 		IntCycle_n => IntCycle_n,
-		REG => REG
+		REG => REG,
+		DIRSet => DIRSet,
+		DIR => DIR
 	);
 
 	process (RESET_n, CLK)

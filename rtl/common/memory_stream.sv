@@ -460,5 +460,19 @@ module memory_stream #(parameter COUNT = 16)
         end
     end
 
+`ifdef V30_SIM_PROBES
+// Traccia il ripristino: header letto, indirizzi, e ogni cambio di stato.
+reg [4:0] dbg_st_d;
+integer dbg_ms = 0;
+always @(posedge clk) begin
+	dbg_st_d <= state;
+	if (state != dbg_st_d && dbg_ms < 40) begin
+		dbg_ms <= dbg_ms + 1;
+		$display("[ms] stato %0d -> %0d  cur=%08h end=%08h hdr=%016h rd=%b",
+		         dbg_st_d, state, current_addr, end_addr, header_data, is_reading);
+	end
+end
+`endif
+
 endmodule
 

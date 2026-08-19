@@ -43,7 +43,7 @@
       sub2main soundlatch → main legge 0xA0004 → coin_credit incrementato
 */
 
-module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
+module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1, parameter SS_IDX_Z80 = -1, parameter SS_IDX_GLUE = -1, parameter SS_IDX_YMSH = -1) (
 	input  wire        clk,
 	input  wire        reset,
 	input  wire        pause,
@@ -52,7 +52,20 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	// OSD volume select (4-bit, pattern BoogieWings):
 	//   0=Default, 1=Mute, 2=MAME, 3..15 = percentuale del Default
 	input  wire  [3:0] fm_vol_sel,  // FM YM3812
-	input  wire  [3:0] oki_vol_sel, // OKI 6295
+	input  wire  [3:0] oki_vol_sel, // OKI 6295 (master)
+	input  wire  [3:0] oki_ch_vol_sel0, // OKI voce 0
+	input  wire  [3:0] oki_ch_vol_sel1, // OKI voce 1
+	input  wire  [3:0] oki_ch_vol_sel2, // OKI voce 2
+	input  wire  [3:0] oki_ch_vol_sel3, // OKI voce 3
+	input  wire  [3:0] fm_ch_vol_sel0, // FM ch 0
+	input  wire  [3:0] fm_ch_vol_sel1,
+	input  wire  [3:0] fm_ch_vol_sel2,
+	input  wire  [3:0] fm_ch_vol_sel3,
+	input  wire  [3:0] fm_ch_vol_sel4,
+	input  wire  [3:0] fm_ch_vol_sel5,
+	input  wire  [3:0] fm_ch_vol_sel6,
+	input  wire  [3:0] fm_ch_vol_sel7,
+	input  wire  [3:0] fm_ch_vol_sel8,
 
 	// ROM download (ioctl)
 	input  wire        ioctl_download,
@@ -82,9 +95,14 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	output reg signed [15:0] audio_l,
 	output reg signed [15:0] audio_r,
 
-	// Savestate slave: z80_ram (stato RAM Z80). I chip T80/YM/OKI e i soundlatch
-	// (transitori handshake) ripartono al load — glitch audio momentaneo, gioco ok.
-	ssbus_if.slave     ss_zram     // z80_ram 2K × 8
+	// Savestate audio COMPLETO: RAM Z80 + registri T80s (REG/DIR, park a confine
+	// istruzione) + shadow/replay registri YM3812 + glue (latch/IRQ/bank/oki_cmd)
+	// + stop-all OKI. Vedi blocchi "Park", "shadow + REPLAY", "glue", "OKI al restore".
+	ssbus_if.slave     ss_zram,    // z80_ram 2K × 8
+	ssbus_if.slave     ss_z80,     // registri interni T80s (REG/DIR nativi)
+	ssbus_if.slave     ss_glue,    // glue: soundlatch/pending/IRQ/bank/vector (ULTIMO idx: commit=trigger replay)
+	ssbus_if.slave     ss_ymsh,    // shadow 256 registri YM3812
+	output wire        z80_ss_ready // Z80 parcheggiato a confine istruzione (gate save DMA)
 );
 
 	// ─── Clock enable: clk_sys (80 MHz) → Z80/YM 3.579545 MHz, OKI 1 MHz ─────
@@ -188,6 +206,22 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 		                          z80_addr;
 
 	reg z80_addr_lsb_d;
+`ifdef SIM_Z80_ROM_FIX
+	// SOLO SIM: lo stream ioctl con SIM_ROM_LEGACY=1 (obbligatorio per il V30)
+	// consegna la ROM Z80 a byte SCAMBIATI -> lo Z80 esegue 0x76 (HALT) e non
+	// ritira mai il latch -> il main salta ogni frame. Qui, a fine download,
+	// sovrascrivo le due BRAM con la ROM nell'ordine giusto (file hex generati
+	// da 8.u212). Nessun effetto in Quartus (define mai attivo).
+	reg dl_prev = 1'b0;
+	always @(posedge clk) begin
+		dl_prev <= ioctl_download;
+		if (dl_prev && !ioctl_download) begin
+			$readmemh("z80rom_lo.hex", z80_rom_lo);
+			$readmemh("z80rom_hi.hex", z80_rom_hi);
+			$display("[z80romfix] ROM Z80 ricaricata da hex (ordine corretto)");
+		end
+	end
+`endif
 	always @(posedge clk) begin
 		if (z80_rom_dl_wr) begin
 			z80_rom_lo[z80_rom_dl_word] <= ioctl_dout[7:0];
@@ -261,11 +295,29 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	wire is_data_hi_w   = reg_cs && (z80_addr[4:0] == 5'h19) && !z80_wr_n;
 	wire is_coin_w      = reg_cs && (z80_addr[4:0] == 5'h1B) && !z80_wr_n;
 
+	// ─── Savestate glue (soundlatch/pending/IRQ/bank/vector/ym_addr/oki_cmd) ─
+	// 63 bit: [0]=rom_bank [8:1]=m2s0 [16:9]=m2s1 [24:17]=s2m0 [32:25]=s2m1
+	// [33]=m2s_pend [34]=s2m_pend [35]=rst10_irq [36]=rst10_srv [37]=rst18_irq
+	// [38]=rst18_srv [46:39]=iack_vector_latched [54:47]=ym_addr_sel
+	// [55]=oki_cmd_pending [62:56]=oki_phrase
+	wire [62:0] glue_out;
+	wire        glue_wr;
+	wire [62:0] glue_in;   // assign dopo le dichiarazioni dei reg (vedi sotto)
+	reg  [7:0]  ym_addr_sel;       // address latch YM3812 (snoop, vedi shadow sotto)
+	reg         oki_cmd_pending_r; // snoop: 1o byte comando OKI scritto, atteso il 2o
+	reg  [6:0]  oki_phrase_r;      // snoop: phrase del 1o byte
+	auto_save_adaptor #(.N_BITS(63), .SS_IDX(SS_IDX_GLUE)) u_ss_glue (
+		.clk(clk), .ssbus(ss_glue),
+		.bits_in(glue_in), .bits_out(glue_out), .bits_wr(glue_wr)
+	);
+
 	// ─── ROM bank register (Z80 0x4007: bit0 → bank 0/1) ─────────────────────
 	// MAME seibu_sound_device::bank_w: m_rom_bank->set_entry(BIT(data,0))
 	always @(posedge clk) begin
 		if (reset)
 			rom_bank <= 1'b0;
+		else if (glue_wr)
+			rom_bank <= glue_out[0];
 		else if (cen_z80 && is_bank_w)
 			rom_bank <= z80_dout[0];
 	end
@@ -301,11 +353,20 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	    (rst18_irq && !rst18_service) ? 8'hDF :
 	    (rst10_irq && !rst10_service) ? 8'hD7 :
 	                                    8'h00;
+
+	// pack glue per savestate (dichiarazioni tutte sopra)
+	assign glue_in = { oki_phrase_r, oki_cmd_pending_r,
+	                   ym_addr_sel, iack_vector_latched, rst18_service, rst18_irq,
+	                   rst10_service, rst10_irq, sub2main_pending,
+	                   main2sub_pending, sub2main[1], sub2main[0],
+	                   main2sub[1], main2sub[0], rom_bank };
 	// Latch al rising edge di iack_active
 	always @(posedge clk) begin
 		if (reset) begin
 			iack_active_d       <= 1'b0;
 			iack_vector_latched <= 8'h00;
+		end else if (glue_wr) begin
+			iack_vector_latched <= glue_out[46:39];
 		end else begin
 			iack_active_d <= iack_active;
 			if (iack_active && !iack_active_d) begin
@@ -326,6 +387,11 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 			rst18_irq     <= 1'b0;
 			rst18_service <= 1'b0;
 			ym_irq_d      <= 1'b0;
+		end else if (glue_wr) begin
+			rst10_irq     <= glue_out[35];
+			rst10_service <= glue_out[36];
+			rst18_irq     <= glue_out[37];
+			rst18_service <= glue_out[38];
 		end else begin
 			ym_irq_d <= ym_irq;
 			// YM IRQ rising/falling → RST10 assert/clear
@@ -375,6 +441,13 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 			sub2main[1]      <= 8'd0;
 			main2sub_pending <= 1'b0;
 			sub2main_pending <= 1'b0;
+		end else if (glue_wr) begin
+			main2sub[0]      <= glue_out[8:1];
+			main2sub[1]      <= glue_out[16:9];
+			sub2main[0]      <= glue_out[24:17];
+			sub2main[1]      <= glue_out[32:25];
+			main2sub_pending <= glue_out[33];
+			sub2main_pending <= glue_out[34];
 		end else begin
 			// Main writes (MAME seibu_sound_device::main_w):
 			//   case 0/1: m_main2sub[offset] = data
@@ -423,20 +496,141 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	wire [7:0] ym_dout;
 	wire signed [15:0] ym_snd;
 	wire        ym_sample;
-	// Pause gate: stop chip cen durante pause (pattern Darius2 darius2_audio_top.sv)
-	wire cen_z80_g = cen_z80 & ~pause;
+	// ─── Park Z80 a confine istruzione (save deterministico) ─────────────────
+	// Condizione a LIVELLO nella finestra (X+1, X+2), PROVATA dal codice T80:
+	//  - fronte X:   M1_n->0 (core); MREQ/IORQ ancora ALTI (il wrapper li
+	//    assere 1 cen dopo) -> un edge-detect M1+MREQ non era MAI vero
+	//    (deadlock del save: bug fixato qui)
+	//  - fronte X+1: MREQ->0 (fetch) oppure IORQ->0 (IACK)
+	//  - fronte X+2: PC+1, IR load, M1_n->1 (T80.vhd:1242), MREQ rilasciato
+	// M1 basso & MREQ basso & IORQ alto = SOLO fetch M1 tra X+1 e X+2:
+	// refresh escluso (M1 alto a T3), IACK escluso (IORQ basso), cicli
+	// memoria esclusi (M1 alto). Congelare li' = PRIMA dell'incremento PC
+	// = confine architetturale esatto. Il save DMA aspetta z80_ss_ready.
+	reg z80_parked;
+	always @(posedge clk) begin
+		if (reset || !pause)
+			z80_parked <= 1'b0;
+		else if (!z80_parked && !z80_m1_n && !z80_mreq_n && z80_iorq_n)
+			z80_parked <= 1'b1;
+	end
+	assign z80_ss_ready = z80_parked;
+
+	// cen gate: Z80+YM congelati SOLO a park avvenuto (pochi us dopo pause)
+	wire cen_z80_g = cen_z80 & ~z80_parked;
 	wire cen_oki_g = cen_oki & ~pause;
+
+	// Gain per-canale FM (default 0x10 = unita' -> identico a prima; bilanciabile da OSD)
+	wire [7:0] fm_chvol0 = gain_resolve(fm_ch_vol_sel0, 8'h10);
+	wire [7:0] fm_chvol1 = gain_resolve(fm_ch_vol_sel1, 8'h10);
+	wire [7:0] fm_chvol2 = gain_resolve(fm_ch_vol_sel2, 8'h10);
+	wire [7:0] fm_chvol3 = gain_resolve(fm_ch_vol_sel3, 8'h10);
+	wire [7:0] fm_chvol4 = gain_resolve(fm_ch_vol_sel4, 8'h10);
+	wire [7:0] fm_chvol5 = gain_resolve(fm_ch_vol_sel5, 8'h10);
+	wire [7:0] fm_chvol6 = gain_resolve(fm_ch_vol_sel6, 8'h10);
+	wire [7:0] fm_chvol7 = gain_resolve(fm_ch_vol_sel7, 8'h10);
+	wire [7:0] fm_chvol8 = gain_resolve(fm_ch_vol_sel8, 8'h10);
+
+	// ─── YM3812 register shadow + REPLAY (savestate stadio 2) ────────────────
+	// Snoop: ogni write Z80 al chip aggiorna shadow[reg] (BRAM 256x8) e
+	// ym_addr_sel (address latch, salvato nel glue). Al RESTORE (glue_wr =
+	// commit dell'ULTIMA sezione, quindi shadow gia' ripristinata) il replay
+	// FSM riscrive tutti i 256 registri nel jtopl2 a passo cen (Z80 in WAIT):
+	// timbri/note/rhythm/TIMER tornano -> la musica riprende dal punto esatto.
+	wire       ym_wr_cen = cen_z80_g & is_ym_w;
+	wire       ymsh_wren;
+	wire [7:0] ymsh_idx, ymsh_wdata;
+	reg  [7:0] ymsh_q;
+	(* ramstyle = "M10K,no_rw_check" *) reg [7:0] ym_shadow [0:255];
+
+	always @(posedge clk) begin
+		if (reset)                          ym_addr_sel <= 8'd0;
+		else if (glue_wr)                   ym_addr_sel <= glue_out[54:47];
+		else if (ym_wr_cen && !z80_addr[0]) ym_addr_sel <= z80_dout;
+	end
+
+	ss_ram_adaptor #(.WIDTH(8), .WIDTHAD(8), .SS_IDX(SS_IDX_YMSH)) u_ss_ymsh (
+		.clk(clk), .wren_in(ym_wr_cen & z80_addr[0]), .addr_in(ym_addr_sel), .wdata_in(z80_dout),
+		.wren_out(ymsh_wren), .addr_out(ymsh_idx), .wdata_out(ymsh_wdata),
+		.q_in(ymsh_q), .ssbus(ss_ymsh)
+	);
+
+	reg       rp_active;
+	reg       rp_pre;     // passo iniziale: reg4<=0x80 (reset flag timer stantii, Difetto 3 audit)
+	reg       rp_final;   // passo finale: ripristina l'address latch del chip = ym_addr_sel
+	reg [7:0] rp_reg;
+	reg [1:0] rp_ph;      // 0=write addr, 1=attesa, 2=write data, 3=attesa lunga
+	reg [6:0] rp_wait;    // 7 bit: data->data deve superare 84 cen (pipeline 18-slot jtopl a cen/4)
+	// il read ss esclude il replay COMBINATORIAMENTE: al primo read del save
+	// post-abort ymsh_q e' latchato 1 clk prima che rp_active scenda -> senza
+	// questo la prima word del chunk verrebbe salvata da rp_reg (off-by-one).
+	wire ymsh_ss_rd = ss_ymsh.access(SS_IDX_YMSH) && ss_ymsh.read;
+	wire [7:0] ymsh_raddr = (rp_active && !ymsh_ss_rd) ? rp_reg : ymsh_idx;
+	always @(posedge clk) begin
+		if (ymsh_wren) ym_shadow[ymsh_idx] <= ymsh_wdata;
+		ymsh_q <= ym_shadow[ymsh_raddr];
+	end
+
+	always @(posedge clk) begin
+		if (reset) begin
+			rp_active <= 1'b0;
+			rp_pre    <= 1'b0;
+			rp_final  <= 1'b0;
+			rp_reg    <= 8'd0;
+			rp_ph     <= 2'd0;
+			rp_wait   <= 7'd0;
+		end else if (glue_wr) begin
+			rp_active <= 1'b1;
+			rp_pre    <= 1'b1;    // prima: reg4<=0x80 (pulisce flag timer del pre-load)
+			rp_final  <= 1'b0;
+			rp_reg    <= 8'd0;
+			rp_ph     <= 2'd0;
+			rp_wait   <= 7'd0;
+		end else if (rp_active && ss_ymsh.access(SS_IDX_YMSH) && ss_ymsh.read) begin
+			rp_active <= 1'b0;    // save partito durante replay: abort (mai letture shadow sporche)
+		end else if (rp_active && cen_z80_g) begin
+			case (rp_ph)
+				2'd0: begin rp_ph <= 2'd1; rp_wait <= 7'd8;   end  // addr scritto su questo cen
+				2'd1: begin
+					if (|rp_wait) rp_wait <= rp_wait - 1'b1;
+					else if (rp_final) rp_active <= 1'b0;          // latch chip = ym_addr_sel: FINE
+					else               rp_ph     <= 2'd2;
+				end
+				2'd2: begin rp_ph <= 2'd3; rp_wait <= 7'd100; end  // data scritto; attesa >84 cen
+				2'd3: begin
+					if (|rp_wait) rp_wait <= rp_wait - 1'b1;
+					else begin
+						rp_ph <= 2'd0;
+						if (rp_pre) rp_pre <= 1'b0;                // dopo il pre-step parte lo sweep da reg 0
+						else begin
+							rp_reg <= rp_reg + 1'b1;
+							if (rp_reg == 8'd255) rp_final <= 1'b1; // ultimo passo: riscrivi address latch
+						end
+					end
+				end
+			endcase
+		end
+	end
+
+	// Bus YM: replay ha priorita' (Z80 in WAIT durante il replay)
+	wire       rp_wr  = rp_active && (rp_ph == 2'd0 || rp_ph == 2'd2);
+	wire       rp_a0  = (rp_ph == 2'd2);
+	wire [7:0] rp_din = rp_a0    ? (rp_pre ? 8'h80 : ymsh_q) :        // data: pre-step=0x80 (flag reset)
+	                    rp_pre   ? 8'h04 :                            // addr: pre-step=reg 4
+	                    rp_final ? ym_addr_sel : rp_reg;              // addr: finale=latch, sweep=reg
 
 	jtopl2 u_jtopl2 (
 		.rst    (reset),
 		.clk    (clk),
 		.cen    (cen_z80_g),
-		.din    (z80_dout),
-		.addr   (z80_addr[0]),
-		.cs_n   (~is_ym_access),
-		.wr_n   (z80_wr_n),
+		.din    (rp_active ? rp_din : z80_dout),
+		.addr   (rp_active ? rp_a0  : z80_addr[0]),
+		.cs_n   (rp_active ? ~rp_wr : ~is_ym_access),
+		.wr_n   (rp_active ? ~rp_wr : z80_wr_n),
 		.dout   (ym_dout),
 		.irq_n  (ym_irq_n),
+		.fmvol0(fm_chvol0), .fmvol1(fm_chvol1), .fmvol2(fm_chvol2), .fmvol3(fm_chvol3), .fmvol4(fm_chvol4),
+		.fmvol5(fm_chvol5), .fmvol6(fm_chvol6), .fmvol7(fm_chvol7), .fmvol8(fm_chvol8),
 		.snd    (ym_snd),
 		.sample (ym_sample)
 	);
@@ -447,17 +641,66 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	wire signed [13:0] oki_sound;
 	wire        oki_sample;
 
+	// ─── OKI al restore: stop-all + comando pendente (deterministico) ────────
+	// Lo stato voci OKI non e' salvato: al restore un campione in riproduzione
+	// continuerebbe (SFX stantio). Al commit restore, 3 write sul bus jt6295
+	// (clk-edge, Z80 fermo): 0x00 (neutralizza un eventuale 1o byte nel chip
+	// pre-load: ch=0 -> nessun start), 0x78 (stop voci 1111), e se il SAVE era
+	// tra i 2 byte di un comando: {1,phrase} (ri-arma il chip: il 2o byte lo
+	// scrivera' lo Z80 ripristinato). Trasparente in gioco normale.
+	reg [3:0] okistop_cnt;
+	always @(posedge clk) begin
+		if (reset)             okistop_cnt <= 4'd0;
+		else if (glue_wr)      okistop_cnt <= 4'd11;
+		else if (|okistop_cnt) okistop_cnt <= okistop_cnt - 1'b1;
+	end
+	wire ok_wrA = (okistop_cnt==4'd11)||(okistop_cnt==4'd10);   // 0x00
+	wire ok_wrB = (okistop_cnt==4'd7) ||(okistop_cnt==4'd6);    // 0x78
+	wire ok_wrC = ((okistop_cnt==4'd3)||(okistop_cnt==4'd2)) && oki_cmd_pending_r; // {1,phrase}
+	wire       okistop_wr  = ok_wrA | ok_wrB | ok_wrC;
+	wire [7:0] okistop_din = ok_wrA ? 8'h00 :
+	                         ok_wrB ? 8'h78 : {1'b1, oki_phrase_r};
+
+	// Snoop protocollo comando OKI (per salvare un comando 2-byte a meta')
+	reg oki_wrline_d;
+	always @(posedge clk) begin
+		oki_wrline_d <= (oki_cs & ~z80_wr_n);
+		if (reset) begin
+			oki_cmd_pending_r <= 1'b0;
+			oki_phrase_r      <= 7'd0;
+		end else if (glue_wr) begin
+			oki_cmd_pending_r <= glue_out[55];
+			oki_phrase_r      <= glue_out[62:56];
+		end else if ((oki_cs & ~z80_wr_n) & ~oki_wrline_d) begin   // fronte write Z80->OKI
+			if (!oki_cmd_pending_r && z80_dout[7]) begin
+				oki_cmd_pending_r <= 1'b1;
+				oki_phrase_r      <= z80_dout[6:0];
+			end else
+				oki_cmd_pending_r <= 1'b0;
+		end
+	end
+
+	// Gain per-voce OKI (default 0x10 = unita' -> mix identico a ora; l'utente bilancia da OSD)
+	wire [7:0] oki_chvol0 = gain_resolve(oki_ch_vol_sel0, 8'h10);
+	wire [7:0] oki_chvol1 = gain_resolve(oki_ch_vol_sel1, 8'h10);
+	wire [7:0] oki_chvol2 = gain_resolve(oki_ch_vol_sel2, 8'h10);
+	wire [7:0] oki_chvol3 = gain_resolve(oki_ch_vol_sel3, 8'h10);
+
 	jt6295 #(.INTERPOL(1)) u_jt6295 (
 		.rst       (reset),
 		.clk       (clk),
 		.cen       (cen_oki_g),
 		.ss        (1'b1),                // PIN7 = HIGH (MAME raiden.cpp:754 verified)
-		.wrn       (~(oki_cs & ~z80_wr_n)),
-		.din       (z80_dout),
+		.wrn       (okistop_wr ? 1'b0 : ~(oki_cs & ~z80_wr_n)),
+		.din       (okistop_wr ? okistop_din : z80_dout),
 		.dout      (oki_dout),
 		.rom_addr  (oki_rom_addr),
 		.rom_data  (oki_rom_data),
 		.rom_ok    (oki_rom_ok),
+		.chvol0    (oki_chvol0),
+		.chvol1    (oki_chvol1),
+		.chvol2    (oki_chvol2),
+		.chvol3    (oki_chvol3),
 		.sound     (oki_sound),
 		.sample    (oki_sample)
 	);
@@ -477,11 +720,57 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 		else                     z80_din = 8'hFF;
 	end
 
-	// ─── T80s Z80 core ───────────────────────────────────────────────────────
+	// ─── T80s Z80 core + savestate registri via REG/DIR nativi ──────────────
+	// T80s (core provato, invariato nel timing) espone REG = 212 bit di stato
+	// interno (IFF2,IFF1,IM,IY,HL',DE',BC',IX,HL,DE,BC,PC,SP,R,I,F',A',F,A);
+	// DIR/DIRSet fanno il load diretto al restore. Adaptor ssbus semplice.
+	// ─── Restore DETERMINISTICO: Z80 in RESET durante tutto il restore ──────
+	// DIRSet a CPU libera = registri caricati a meta' istruzione -> 1 istruzione
+	// spazzatura -> esito variabile. Fix: alla prima write di restore su un
+	// nostro chunk lo Z80 va in RESET (FSM interno = confine pulito); al commit
+	// finale (glue_wr) rilascio il reset e DIRSet al ciclo dopo -> PC/registri
+	// caricati su CPU vergine = restore SEMPRE identico. Timeout di sicurezza:
+	// save vecchi senza chunk glue non lasciano lo Z80 in reset per sempre.
+	reg        restoring;
+	reg        dirset_arm;
+	reg [21:0] restore_tmo;
+	wire restore_wr_any = (ss_zram.access(SS_IDX_ZRAM) & ss_zram.write)
+	                    | (ss_z80.access(SS_IDX_Z80)   & ss_z80.write)
+	                    | (ss_ymsh.access(SS_IDX_YMSH) & ss_ymsh.write)
+	                    | (ss_glue.access(SS_IDX_GLUE) & ss_glue.write);
+	always @(posedge clk) begin
+		if (reset) begin
+			restoring   <= 1'b0;
+			dirset_arm  <= 1'b0;
+			restore_tmo <= 22'd0;
+		end else begin
+			dirset_arm <= 1'b0;
+			if (glue_wr) begin
+				restoring   <= 1'b0;
+				dirset_arm  <= 1'b1;   // DIRSet al ciclo dopo il rilascio del reset
+			end else if (restore_wr_any) begin
+				restoring   <= 1'b1;
+				restore_tmo <= 22'd0;
+			end else if (restoring) begin
+				restore_tmo <= restore_tmo + 1'b1;
+				if (&restore_tmo) restoring <= 1'b0;   // ~52ms senza write: abort (save vecchio)
+			end
+		end
+	end
+
 	wire t80_busrq_n   = 1'b1;
-	wire t80_wait_n    = 1'b1;
+	wire t80_wait_n    = ~rp_active;   // Z80 in WAIT durante il replay YM (post-restore)
 	wire t80_nmi_n     = 1'b1;
-	wire t80_reset_n   = ~reset & ~snd_reset_in;
+	wire t80_reset_n   = ~reset & ~snd_reset_in & ~restoring;
+
+	wire [211:0] z80_reg_out;
+	wire [211:0] z80_dir;
+	wire         z80_dir_set;
+
+	auto_save_adaptor #(.N_BITS(212), .SS_IDX(SS_IDX_Z80)) u_ss_z80 (
+		.clk(clk), .ssbus(ss_z80),
+		.bits_in(z80_reg_out), .bits_out(z80_dir), .bits_wr(z80_dir_set)
+	);
 
 	T80s u_z80 (
 		.RESET_n (t80_reset_n),
@@ -503,21 +792,114 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 		.A       (z80_addr),
 		.DI      (z80_din),
 		.DO      (z80_dout),
-		.REG     ()
+		.REG     (z80_reg_out),
+		.DIRSet  (dirset_arm),   // NON dal commit chunk (arriverebbe a meta' istruzione): 1 clk dopo il rilascio del reset
+		.DIR     (z80_dir)
 	);
+
+`ifdef V30_SIM_PROBES
+	// I byte della ROM Z80 come li vede la CPU: in MAME 0010 = C3 76 10.
+	// Se qui sono diversi, la ROM audio in sim e' caricata male (artefatto mio).
+	integer rb = 0;
+	always @(posedge clk) begin
+		if (cen_z80 && rom_lo_cs && !z80_rd_n && z80_addr <= 16'h001B && rb < 28) begin
+			rb <= rb + 1;
+			$display("[zrom] %04h = %02h", z80_addr, z80_rom_q);
+		end
+	end
+
+	// Cosa succede DOPO l'interrupt: vettore latchato + ogni scrittura dello
+	// Z80 sui registri Seibu 0x4000-0x401F (4000 = ack comando, 4001/4003 = EOI).
+	integer dbg_n = 0;
+	reg iack_d2;
+	always @(posedge clk) begin
+		iack_d2 <= iack_active;
+		if (iack_active && !iack_d2 && dbg_n < 40) begin
+			dbg_n <= dbg_n + 1;
+			$display("[iack] vettore latchato = %02h (rst18_irq %b service %b)",
+			         iack_vector_now, rst18_irq, rst18_service);
+		end
+		if (cen_z80 && reg_cs && !z80_wr_n && dbg_n < 40) begin
+			dbg_n <= dbg_n + 1;
+			$display("[zwr] Z80 scrive %04h = %02h", z80_addr, z80_dout);
+		end
+	end
+
+	// DOVE gira lo Z80: campiono l'indirizzo dei fetch M1. Se pochi indirizzi
+	// dominano, e' fermo in un ciclo di attesa e non arriva mai a scrivere
+	// l'ack del comando (0x4000).
+	integer zs = 0;
+	reg zm1_d;
+	always @(posedge clk) begin
+		zm1_d <= z80_m1_n;
+		if (!z80_m1_n && zm1_d) begin
+			zs <= zs + 1;
+			if (zs % 32 == 0) $display("[zpc] %04h", z80_addr);
+		end
+	end
+
+	// L'RST18 arriva allo Z80? Conto: comandi dal main, RST18 alzati,
+	// interrupt riconosciuti dallo Z80 (M1+IORQ), ack scritti dallo Z80.
+	integer n_cmd=0, n_rst=0, n_iack=0, n_ack=0, n_clk=0;
+	reg rst18_d, iack_d;
+	always @(posedge clk) begin
+		n_clk <= n_clk + 1;
+		rst18_d <= rst18_irq;
+		iack_d  <= (~z80_m1_n & ~z80_iorq_n);
+		if (snd_cs && snd_wr && (snd_addr == 3'd2 || snd_addr == 3'd6)) n_cmd <= n_cmd + 1;
+		if (rst18_irq && !rst18_d) n_rst <= n_rst + 1;
+		if ((~z80_m1_n & ~z80_iorq_n) && !iack_d) n_iack <= n_iack + 1;
+		if (cen_z80 && is_pending_w) n_ack <= n_ack + 1;
+		if (n_clk % 1346560 == 0 && n_clk != 0) begin
+			$display("[irq18] frame: comandi %0d  RST18 %0d  iack Z80 %0d  ack scritti %0d  int_n %b",
+			         n_cmd, n_rst, n_iack, n_ack, z80_int_n);
+			n_cmd<=0; n_rst<=0; n_iack<=0; n_ack<=0;
+		end
+	end
+
+	// QUANTO CI METTE lo Z80 a ritirare il comando del main. Se supera un frame
+	// (1.346.560 clk a 80 MHz) al vblank dopo il main trova pending=1 e SALTA
+	// il lavoro del frame (FDC34). Stampo anche quante volte resta appeso.
+	integer pend_t = 0, pend_max = 0;
+	reg m2s_d;
+	always @(posedge clk) begin
+		m2s_d <= main2sub_pending;
+		if (main2sub_pending && !m2s_d)      pend_t <= 0;
+		else if (main2sub_pending)           pend_t <= pend_t + 1;
+		if (!main2sub_pending && m2s_d) begin
+			if (pend_t > pend_max) pend_max <= pend_t;
+			$display("[pend] ritirato dopo %0d clk = %0d us  (frame = 1346560 clk)", pend_t, pend_t/80);
+		end
+	end
+
+	// Lo Z80 audio sta girando? Fetch M1 per frame + stato del latch Seibu.
+	// Se main2sub_pending resta 1 il main SALTA il lavoro del frame (FDC34).
+	integer z_m1 = 0, z_clk = 0;
+	reg m1_d;
+	always @(posedge clk) begin
+		z_clk <= z_clk + 1;
+		m1_d  <= z80_m1_n;
+		if (!z80_m1_n && m1_d) z_m1 <= z_m1 + 1;
+		if (z_clk % 1346570 == 0 && z_clk != 0) begin
+			$display("[z80] frame: fetch M1 %0d  pending %b  reset_n %b  snd_reset_in %b",
+			         z_m1, main2sub_pending, t80_reset_n, snd_reset_in);
+			z_m1 <= 0;
+		end
+	end
+`endif
 
 	// ─── Mixer audio: jtframe_mixer Toki pattern (Q4.4 gains) ────────────────
 	// Volume OSD pattern BoogieWings: Default/Mute/MAME + percentuali che
 	// scalano il DEFAULT. Cambiando DEF_GAIN_* tutte le % scalano con lui.
-	// Gain Q4.4: 0x10 = 1.0x. jtframe_mixer satura internamente.
+	// Gain Q4.4: 0x10 = 1.0x. La saturazione la fa il soft-clip sotto (no crackle).
 	// Default Raiden tarato HW (screenshot 2026-07-13): FM 500%, ADPCM 400%
 	// del gain MAME base (FM 0x10, OKI 0x0C). Loudness allineata ad altri core.
 	//   FM  : 0x10 × 5 = 0x50   (= era 100% MAME × 5.0)
 	//   OKI : 0x0C × 4 = 0x30   (= era  75% MAME × 4.0)
 	// Le percentuali OSD scalano da QUESTI nuovi default. MAME (sel 2) resta
 	// il valore MAME-esatto originale (0x10 / 0x0C) per chi vuole l'accurato.
-	localparam [7:0] DEF_GAIN_FM  = 8'h50;   // FM  tarato (5× MAME 1.0)
-	localparam [7:0] DEF_GAIN_OKI = 8'h30;   // OKI tarato (4× MAME 0.75)
+	localparam [7:0] DEF_GAIN_FM  = 8'h40;   // FM  4x (abbassato un po' entrambi)
+	localparam [7:0] DEF_GAIN_OKI = 8'h70;   // OKI: pareggiato all'FM (da 0xA0) + abbassato un po'
 
 	// mul Q4.8 (256 = 100% del Default). Voci OSD 2..14 (0=Default, 1=Mute).
 	function [11:0] osd_mul_aud;
@@ -546,13 +928,11 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 		input [7:0] def_g;
 		reg [19:0] scaled;
 		begin
+			scaled = def_g * osd_mul_aud(sel);   // sempre assegnata: niente latch inferito
 			case (sel)
 				4'd0: gain_resolve = def_g;    // Default (tarato)
 				4'd1: gain_resolve = 8'h00;    // Mute
-				default: begin
-					scaled = def_g * osd_mul_aud(sel);
-					gain_resolve = (scaled[19:8] > 12'hFF) ? 8'hFF : scaled[15:8];
-				end
+				default: gain_resolve = (scaled[19:8] > 12'hFF) ? 8'hFF : scaled[15:8];
 			endcase
 		end
 	endfunction
@@ -560,26 +940,33 @@ module Raiden_audio_z80 #(parameter SS_IDX_ZRAM = -1) (
 	wire [7:0] fm_gain  = gain_resolve(fm_vol_sel,  DEF_GAIN_FM);
 	wire [7:0] oki_gain = gain_resolve(oki_vol_sel, DEF_GAIN_OKI);
 
-	wire signed [15:0] mixed_mono;
-	jtframe_mixer #(.W1(14)) u_mixer (
-		.rst   (reset),
-		.clk   (clk),
-		.cen   (1'b1),
-		.ch0   (ym_snd),       // FM YM3812
-		.ch1   (oki_sound),    // PCM OKI
-		.ch2   (16'd0),
-		.ch3   (16'd0),
-		.gain0 (fm_gain),
-		.gain1 (oki_gain),
-		.gain2 (8'd0),
-		.gain3 (8'd0),
-		.mixed (mixed_mono),
-		.peak  ()
-	);
+	// ─── Somma larga + soft-clip sui SOLI picchi (no crackling, niente tagli) ─
+	// Somma su bus largo (stessi gain), poi soft-clip SOLO in cima. Sotto TH
+	// (~-1 dBFS) tutto e' LINEARE = IDENTICO al mixer pulito: bassi, medi, corpi
+	// e code delle esplosioni INTATTI. SOLO le punte che nel pulito clippavano
+	// dure (= il crackling) vengono arrotondate dolci (parabola tangente in TH,
+	// slope 0 al tetto = niente gradino) verso un tetto appena sotto il fondo
+	// scala. Waveshaper STATICO -> niente pumping, dinamica intatta.
+	wire signed [15:0] oki_ext16  = {oki_sound, 2'b0}; // 14->16bit x4 (+12dB): OKI a scala FM (era 1/4)
+	wire signed [24:0] fm_scaled  = ym_snd    * $signed({1'b0, fm_gain});
+	wire signed [24:0] oki_scaled = oki_ext16 * $signed({1'b0, oki_gain});
+	wire signed [25:0] mix_sum    = $signed({fm_scaled[24],  fm_scaled})
+	                              + $signed({oki_scaled[24], oki_scaled});
+	wire signed [25:0] mix_ovr    = mix_sum >>> 4;                 // scala sample (gain Q4.4)
+
+	localparam signed [25:0] TH   = 26'sd29000;   // ~-1 dBFS: sotto = IDENTICO al pulito
+	localparam signed [25:0] TWOR = 26'sd4096;    // 2R (R=2048) -> tetto TH+R = 31048 (-0.4 dBFS)
+	wire signed [25:0] amag = mix_ovr[25] ? -mix_ovr : mix_ovr;   // |mix|
+	wire signed [25:0] d0   = amag - TH;
+	wire signed [25:0] dc   = d0[25] ? 26'sd0 : (d0 >= TWOR ? TWOR : d0);   // clamp [0, 2R]
+	wire signed [28:0] dc2  = dc * dc;
+	wire signed [25:0] yabs = (amag <= TH) ? amag : (TH + dc - (dc2 >>> 13));  // 4R = 2^13
+	wire signed [25:0] yfull = mix_ovr[25] ? -yabs : yabs;
+	wire signed [15:0] mix_out = yfull[15:0];
 
 	always @(posedge clk) begin
-		audio_l <= mixed_mono;
-		audio_r <= mixed_mono;
+		audio_l <= mix_out;
+		audio_r <= mix_out;
 	end
 
 endmodule

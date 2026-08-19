@@ -17,6 +17,7 @@
     along with Raiden_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
 
     Author: Umberto Parisi (rmonic79)
+    Version: 1.0
     Date: 2026
 
 */
@@ -54,10 +55,10 @@ module rom_cache #(
 localparam ENTRIES = 1 << CACHE_BITS;
 localparam TAG_BITS = 23 - CACHE_BITS;  // word addr is [23:1], index is [CACHE_BITS:1]
 
-// Cache storage
-(* ramstyle = "M10K,no_rw_check" *) reg [15:0]          cache_data [0:ENTRIES-1];
-(* ramstyle = "M10K,no_rw_check" *) reg [TAG_BITS-1:0]  cache_tag  [0:ENTRIES-1];
-reg [ENTRIES-1:0] cache_valid;
+// Cache storage. Valid dentro la M10K del tag ({valid,tag}): con 8K entry un
+// vettore FF sarebbe 8192 registri. Invalidazione = sweep in M10K al reset.
+(* ramstyle = "M10K,no_rw_check" *) reg [15:0]        cache_data [0:ENTRIES-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [TAG_BITS:0]  cache_tag  [0:ENTRIES-1];
 
 // Address decomposition (word address)
 wire [22:0]          word_addr = cpu_addr[23:1];
@@ -70,18 +71,19 @@ reg [TAG_BITS-1:0] rd_tag;
 reg                rd_valid;
 
 always @(posedge clk) begin
-	rd_data  <= cache_data[idx];
-	rd_tag   <= cache_tag[idx];
-	rd_valid <= cache_valid[idx];
+	rd_data              <= cache_data[idx];
+	{rd_valid, rd_tag}   <= cache_tag[idx];
 end
 
 // FSM
-localparam S_IDLE    = 2'd0;
-localparam S_CHECK   = 2'd1;
-localparam S_MISS    = 2'd2;
-localparam S_FILL    = 2'd3;
+localparam S_INIT    = 3'd4;   // sweep invalidazione post-reset
+localparam S_IDLE    = 3'd0;
+localparam S_CHECK   = 3'd1;
+localparam S_MISS    = 3'd2;
+localparam S_FILL    = 3'd3;
 
-reg  [1:0]  state;
+reg  [2:0]  state;
+reg [CACHE_BITS-1:0] init_cnt;
 reg         req_prev;
 reg [22:0]  pending_word_addr;
 reg [TAG_BITS-1:0] pending_tag;
@@ -96,14 +98,21 @@ always @(posedge clk) begin
 	sdram_req  <= 1'b0;
 
 	if (reset) begin
-		state             <= S_IDLE;
+		state             <= S_INIT;
 		req_prev          <= 0;
-		cache_valid       <= {ENTRIES{1'b0}};
+		init_cnt          <= 0;
 		pending_word_addr <= 23'h7FFFFF;   // valore impossibile come "last served"
 	end else begin
 		req_prev <= cpu_req;
 
 		case (state)
+			S_INIT: begin
+				// sweep: invalida tutte le entry (valid=0 nel tag M10K)
+				cache_tag[init_cnt] <= {(TAG_BITS+1){1'b0}};
+				init_cnt <= init_cnt + 1'b1;
+				if (init_cnt == {CACHE_BITS{1'b1}}) state <= S_IDLE;
+			end
+
 			S_IDLE: begin
 				// Start new lookup whenever cpu_req is high AND the address
 				// is different from the last one served (avoid re-serving in loop).
@@ -135,8 +144,7 @@ always @(posedge clk) begin
 				if (sdram_ready) begin
 					// Fill cache and return data
 					cache_data[pending_idx]  <= sdram_data;
-					cache_tag[pending_idx]   <= pending_tag;
-					cache_valid[pending_idx] <= 1'b1;
+					cache_tag[pending_idx]   <= {1'b1, pending_tag};
 					cpu_data  <= sdram_data;
 					cpu_ready <= 1'b1;
 					state     <= S_IDLE;

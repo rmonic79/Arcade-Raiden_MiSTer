@@ -91,6 +91,24 @@ always @(posedge clk) begin
 end
 assign dbg_irq_pending = irq_pending;
 
+// irq_pending gira a clk LIBERO e il suo cono arriva ai registri di SEGMENTO
+// della richiesta nel BIU (r_rq_seg), cioe' dentro il calcolo dell'indirizzo
+// fisico del ciclo di bus. MISURATO 2026-08-17 sulla build 15:05, con la
+// coperta `irq_pending -> *v30_core:u_core*` rimossa dall'SDC:
+//     -3.385 ns   irq_pending -> v30u_biu:u_biu|r_rq_seg[1][0]
+// cioe' il percorso chiede 15.885 ns e a clock libero ne ha 12.5. La coperta
+// dichiarava 2 periodi dove ce n'e' 1: STA verde e SILICIO CHE SBAGLIA -- la
+// stessa forma del bug punteggio storico (multicycle 9 falso, -11.03/-11.85)
+// e di CE_HALF a +1 clk (-11.316, vedi cpu_v30_bridge). L'INT arriva a vblank,
+// quando il gioco disegna l'HUD: se il fronte cade mentre il BIU forma il
+// segmento, il ciclo va all'indirizzo sbagliato -> tile nella cella accanto.
+// Registrandolo su ce il lancio e' ce-paced: il percorso diventa CE->CE e ha
+// 62.5 ns (CE_GAP_MIN=5) contro i 15.885 richiesti. INT e' un livello che resta
+// alto fino all'acknowledge, quindi un ce di ritardo non cambia la semantica.
+reg irq_pending_ce;
+always @(posedge clk) if (ce) irq_pending_ce <= irq_pending;
+
+
 // ─── Address translator (M72 pal.sv pattern) ────────────────────────────
 wire        ls245_en;
 wire [23:0] sdr_addr;
@@ -126,14 +144,12 @@ raiden_addr_main u_addr (
 reg main_rq_active;
 reg main_rd_lat;
 reg [15:0] main_ram_rom_data;
-reg main_rom_addr_lo;     // byte select latched per ROM fetch
 reg [23:0] main_rom_addr_lat;   // pattern M72 m72.v:262-269: addr LATCHED nel FSM
 always @(posedge clk) begin
 	if (reset) begin
 		main_rq_active    <= 1'b0;
 		main_rd_lat       <= 1'b0;
 		main_ram_rom_data <= 16'd0;
-		main_rom_addr_lo  <= 1'b0;
 		main_rom_addr_lat <= 24'd0;
 	end else begin
 		main_rd_lat <= cpu_rd;
@@ -141,7 +157,6 @@ always @(posedge clk) begin
 			if (ls245_en && cpu_rd && !main_rd_lat) begin
 				// Rising edge cpu_rd in ROM region → start fetch
 				main_rq_active    <= 1'b1;
-				main_rom_addr_lo  <= cpu_addr[0];   // latch byte select
 				main_rom_addr_lat <= sdr_addr;      // latch addr — non passare-attraverso
 			end
 		end else if (main_rom_ready) begin
@@ -154,6 +169,56 @@ end
 assign main_rom_addr = main_rom_addr_lat;
 assign main_rom_req  = main_rq_active;
 
+
+// LAG DI ASSESTAMENTO DOPO IL FETCH (root-cause storico ba9cf5e, adattato).
+// main_ram_rom_data si aggiorna al clock in cui arriva main_rom_ready; rdata_q in
+// v30_bus lo campiona UN clock dopo. Se il CE riparte subito, il BIU consuma
+// la parola PRECEDENTE: e' l'immediato letto storto che disallinea indice/NUL
+// in itoa (0xfe55) -> il NUL non termina la stringa -> strcpy 0xf150 sfora di
+// 2 celle con residuo stantio -> punteggio con 2 celle sporche, RAM corretta.
+// Il bridge aveva un lag conservativo di 2 clk per questo motivo; il passaggio
+// al CE-stall l'ha perso. Qui lo ripristino: lo stallo resta alto 2 clk dopo
+// il ready, cioe' finche' rdata_q non presenta il dato nuovo.
+reg [1:0] rom_settle;
+always @(posedge clk) begin
+	if (reset)                            rom_settle <= 2'd0;
+	else if (main_rq_active && main_rom_ready)   rom_settle <= 2'd2;
+	else if (rom_settle != 2'd0)          rom_settle <= rom_settle - 2'd1;
+end
+`ifdef NO_ROM_SETTLE
+wire main_stall_eff = main_rq_active;                        // fix DISATTIVATA (solo per A/B in sim)
+`else
+wire main_stall_eff = main_rq_active | (rom_settle != 2'd0);
+`endif
+
+`ifdef V30_SIM_PROBES
+// CORSA DEL FETCH: il BIU campiona rdata_q, che vale cpu_din del clock
+// PRECEDENTE. Se al CE il dato e' cambiato proprio in quel clock, il core
+// consuma la parola vecchia -> immediato storto (root-cause ba9cf5e).
+integer race_n = 0, ce_n = 0, rdce_n = 0;
+reg [15:0] cpu_din_d;
+always @(posedge clk) begin
+	cpu_din_d <= cpu_din;
+	if (ce) begin
+		ce_n <= ce_n + 1;
+		if (main_rd_lat) rdce_n <= rdce_n + 1;
+		if (main_rd_lat && (cpu_din !== cpu_din_d)) begin
+			race_n <= race_n + 1;
+			if (race_n < 12)
+				$display("[race %m] CE su dato NON assestato: din=%04h rdata_q=%04h", cpu_din, cpu_din_d);
+		end
+	end
+end
+// stampa periodica: `final` non viene eseguito da questo banco
+integer race_win = 0;
+always @(posedge clk) begin
+	race_win <= race_win + 1;
+	if (race_win == 2_000_000)
+		$display("[race %m] corse=%0d  CE=%0d  CE-con-lettura=%0d", race_n, ce_n, rdce_n);
+	if (race_win == 2_000_000) race_win <= 0;
+end
+`endif
+
 // ─── CE generator pattern M72 ───────────────────────────────────────────
 wire ce, ce_4x;
 raiden_ce_gen u_ce (
@@ -162,7 +227,8 @@ raiden_ce_gen u_ce (
 	.pause         (pause),
 	.clk_sel       (clk_sel),
 	.ls245_en      (ls245_en),
-	.mem_rq_active (main_rq_active),
+	.rd_lat        (main_rd_lat),
+	.mem_rq_active (main_stall_eff),
 	.ce            (ce),
 	.ce_4x         (ce_4x)
 );
@@ -173,13 +239,14 @@ cpu_v30_bridge #(.SS_IDX(SS_IDX_CPU)) u_cpu (
 	.ce            (ce),
 	.ce_4x         (ce_4x),
 	.reset         (reset),
+	.rom_wait      (main_rq_active),
 	.bus_addr      (cpu_addr),
 	.bus_read      (cpu_rd),
 	.bus_write     (cpu_wr),
 	.bus_be        (cpu_be),
 	.bus_dout      (cpu_dout),
 	.bus_din       (cpu_din),
-	.irq_req       (irq_pending),
+	.irq_req       (irq_pending_ce),
 	.irq_vector    (10'h0C8),
 	.cpu_idle      (cpu_idle),
 	.cpu_halt      (),
@@ -199,14 +266,14 @@ initial begin
 end
 
 wire [13:0] ram_word_addr = cpu_addr[14:1];
-// write-enable originali (usati anche da txt/scroll — NON rimuovere)
-wire ram_wr_lo = cpu_wr && cpu_be[0] && !cpu_be[1] && !cpu_addr[0];
-wire ram_wr_hi = cpu_wr && cpu_be[0] && !cpu_be[1] &&  cpu_addr[0];
-wire ram_wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
+// M72-native byte lanes: cpu_be[0]=lane bassa (A0==0), cpu_be[1]=lane alta.
+// cpu_dout è già sulla lane giusta (niente shuffle/replica). Usati da ram/txt/scroll.
+wire cpu_we_lo = cpu_wr && cpu_be[0];
+wire cpu_we_hi = cpu_wr && cpu_be[1];
 // write-enable work RAM gated su ram_memrq, per l'adaptor savestate
-wire ram_we_lo_cpu = ram_memrq && (ram_wr_lo || ram_wr_w);
-wire ram_we_hi_cpu = ram_memrq && (ram_wr_hi || ram_wr_w);
-wire [15:0] ram_wdata_cpu = ram_wr_w ? cpu_dout : {cpu_dout[7:0], cpu_dout[7:0]};
+wire ram_we_lo_cpu = ram_memrq && cpu_we_lo;
+wire ram_we_hi_cpu = ram_memrq && cpu_we_hi;
+wire [15:0] ram_wdata_cpu = cpu_dout;
 
 // Savestate adaptor in serie sulla porta CPU (ZERO BRAM): SS idle → segnali gioco;
 // durante SS → porta dirottata al ssbus (SS_IDX_WORKRAM).
@@ -267,10 +334,78 @@ initial begin integer i; for (i=0; i<1024; i=i+1) begin txt_lo[i]=0; txt_hi[i]=0
 initial begin integer i; for (i=0; i<1024; i=i+1) begin txt_lo_buf[i]=0; txt_hi_buf[i]=0; end end
 
 wire [9:0] txt_word_addr = cpu_addr[10:1];
-wire txt_we_lo_cpu = text_memrq && (ram_wr_lo || ram_wr_w);
-wire txt_we_hi_cpu = text_memrq && (ram_wr_hi || ram_wr_w);
+wire txt_we_lo_cpu = text_memrq && cpu_we_lo;
+wire txt_we_hi_cpu = text_memrq && cpu_we_hi;
 wire [7:0] txt_din_lo = cpu_dout[7:0];
-wire [7:0] txt_din_hi = ram_wr_w ? cpu_dout[15:8] : cpu_dout[7:0];
+wire [7:0] txt_din_hi = cpu_dout[15:8];
+
+`ifdef V30_SIM_PROBES
+// CHI SCRIVE le celle sporche dell'area punteggio (parole 670, 702, 990, 1022
+// = 0x0C53C/0x0C57C/0x0C7BC/0x0C7FC). Stampo indirizzo, dato e corsie: se il
+// dato e' un tile grafico (6x/cx/ax) invece di uno spazio/cifra, la scrittura
+// e' finita qui per errore di INDIRIZZO e questo dice da dove parte.
+always @(posedge clk) begin
+    // Tutte le scritture nella text RAM, nello stesso formato del tap MAME.
+    // UNA riga per scrittura: il segnale di write e' un LIVELLO che dura tutto
+    // il T3, quindi va rilevato sul FRONTE, altrimenti si stampa 6 volte.
+    txtw_d <= (txt_we_lo_cpu || txt_we_hi_cpu);
+    if ((txt_we_lo_cpu || txt_we_hi_cpu) && !txtw_d)
+        $display("W %05h %04h", {cpu_addr[19:1], 1'b0}, cpu_dout);
+end
+
+// CHI CHIAMA la stampa delle due celle in coda al campo punteggio.
+// Storia degli ultimi 24 indirizzi di fetch di codice: quando arriva una
+// scrittura sulle celle sporche (idx 350/382/670/702/990/1022) li stampo.
+// Il sito di CALL della routine che stampa quei tile e' fra questi, perche'
+// outfunc e' corta: da li' si va al disasm e si sa CHI stampa e con che
+// intenzione (posiziona il cursore o no).
+reg [19:0] cf_hist [0:23];
+reg  [4:0] cf_wp = 5'd0;
+reg        cf_dumped = 1'b0;
+always @(posedge clk) begin
+    if (ce && u_cpu.u_core.t_state == 3'd1 &&
+        u_cpu.u_core.lat_type == 3'b100) begin
+        cf_hist[cf_wp[4:0] % 24] <= u_cpu.u_core.addr_lat;
+        cf_wp <= (cf_wp == 5'd23) ? 5'd0 : cf_wp + 5'd1;
+    end
+    if (!cf_dumped && (txt_we_lo_cpu || txt_we_hi_cpu) && !txtw_d &&
+        (txt_word_addr == 10'd350 || txt_word_addr == 10'd382 ||
+         txt_word_addr == 10'd670 || txt_word_addr == 10'd702) &&
+        cpu_dout[15:8] != 8'h00) begin
+        cf_dumped <= 1'b1;
+        $display("[call] scrittura idx=%0d dato=%04h — ultimi fetch:", txt_word_addr, cpu_dout);
+        for (int k = 0; k < 24; k++)
+            $display("[call]   %02d %05h", k, cf_hist[(cf_wp + k) % 24]);
+    end
+end
+`endif
+
+`ifdef V30_SIM_PROBES
+// DUMP TEXT RAM: 32x32 tile. Stampato una volta sola, dopo che il restore del
+// savestate ha finito di riempirla (ritardo fisso in clock). Serve a vedere
+// COME e' fatta la corruzione nell'area punteggio: tile vicino = errore di
+// indirizzo, byte scambiati = errore di corsia, valore estraneo = scrittura
+// di qualcun altro.
+integer txt_dump_t = 0;
+reg txtw_d = 1'b0;
+reg     txt_dumped = 1'b0;
+always @(posedge clk) begin
+    txt_dump_t <= txt_dump_t + 1;
+    if (!txt_dumped && txt_dump_t == 32'd120_000_000) begin
+        txt_dumped <= 1'b1;
+        for (int r = 0; r < 32; r++) begin
+            string s; s = "";
+            for (int c = 0; c < 32; c++) s = {s, $sformatf("%02h ", txt_lo[r*32+c])};
+            $display("[txtlo %02d] %s", r, s);
+        end
+        for (int r = 0; r < 32; r++) begin
+            string s; s = "";
+            for (int c = 0; c < 32; c++) s = {s, $sformatf("%02h ", txt_hi[r*32+c])};
+            $display("[txthi %02d] %s", r, s);
+        end
+    end
+end
+`endif
 
 // Savestate adaptor sul CPU bank txt (il double-buffer si ricostruisce a vblank).
 reg  [15:0] txt_ss_rdata;
@@ -330,12 +465,10 @@ reg [15:0] scroll_ram [0:31];
 initial begin integer i; for (i=0; i<32; i=i+1) scroll_ram[i] = 16'd0; end
 wire [4:0] scroll_word_addr = cpu_addr[5:1];
 // wdata scroll: nel caso word entrambi i byte, altrimenti byte replicato su lo
-wire        scroll_wren_cpu = scroll_memrq && (ram_wr_lo || ram_wr_hi || ram_wr_w);
-wire [15:0] scroll_wdata_cpu = ram_wr_w ? cpu_dout
-                             : ram_wr_hi ? {cpu_dout[7:0], 8'h00}
-                             :             {8'h00, cpu_dout[7:0]};
+wire        scroll_wren_cpu = scroll_memrq && (cpu_we_lo || cpu_we_hi);
+wire [15:0] scroll_wdata_cpu = cpu_dout;
 // byte-enable per write parziale: durante SS scriviamo word intera (ssbus).
-wire [1:0]  scroll_be_cpu = ram_wr_w ? 2'b11 : ram_wr_hi ? 2'b10 : 2'b01;
+wire [1:0]  scroll_be_cpu = {cpu_be[1], cpu_be[0]};
 
 reg  [15:0] scroll_ss_rdata;
 wire        scroll_wren;
@@ -392,18 +525,13 @@ assign snd_wdata  = cpu_dout;
 // ─── Shared RAM bridge (Main side, modulo fisico in TOP) ──────────────
 assign main_shared_addr  = cpu_addr[11:1];
 assign main_shared_cs    = shared_memrq;
-assign main_shared_we    = (shared_memrq && cpu_wr) ?
-                           ((cpu_be[1] && cpu_be[0]) ? 2'b11 :
-                            (cpu_be[0] && !cpu_addr[0]) ? 2'b01 :
-                            (cpu_be[0] &&  cpu_addr[0]) ? 2'b10 : 2'b00) : 2'b00;
-assign main_shared_wdata = (cpu_be[0] && !cpu_be[1] && cpu_addr[0]) ?
-                           {cpu_dout[7:0], cpu_dout[7:0]} : cpu_dout;
+assign main_shared_we    = (shared_memrq && cpu_wr) ? {cpu_be[1], cpu_be[0]} : 2'b00;
+assign main_shared_wdata = cpu_dout;
 
 // ─── DOUT_VALID mux for cpu_din (pattern M72 m72.v:319-329) ────────────
 // Latch 1-cycle dei memrq per allinearsi con BRAM 1-cycle latency.
 reg ram_rd_lat, text_rd_lat, p1p2_rd_lat, dsw_rd_lat, sound_rd_lat;
 reg shared_rd_lat;
-reg cpu_addr_lo_lat;
 reg [15:0] p1p2_data_lat, dsw_data_lat, sound_data_lat;
 
 always @(posedge clk) begin
@@ -414,7 +542,6 @@ always @(posedge clk) begin
 		dsw_rd_lat       <= 1'b0;
 		sound_rd_lat     <= 1'b0;
 		shared_rd_lat    <= 1'b0;
-		cpu_addr_lo_lat  <= 1'b0;
 		p1p2_data_lat    <= 16'd0;
 		dsw_data_lat     <= 16'd0;
 		sound_data_lat   <= 16'h00FF;
@@ -425,7 +552,6 @@ always @(posedge clk) begin
 		dsw_rd_lat      <= cpu_rd & dsw_memrq;
 		sound_rd_lat    <= cpu_rd & sound_memrq;
 		shared_rd_lat   <= cpu_rd & shared_memrq;
-		cpu_addr_lo_lat <= cpu_addr[0];
 		// IO data latch
 		p1p2_data_lat   <= {p2_input, p1_input};
 		dsw_data_lat    <= dsw_input;
@@ -433,24 +559,117 @@ always @(posedge clk) begin
 	end
 end
 
-// Byte align V30 (richiesto byte sempre su [7:0])
-function [15:0] byte_align;
-	input [15:0] data;
-	input        addr_lo;
-	begin
-		byte_align = addr_lo ? {data[7:0], data[15:8]} : data;
-	end
-endfunction
-
+// Core M72 lane-aware: ritorna la word naturale, il core seleziona il byte
+// (cpu_be/A0) internamente — niente byte_align.
 // Pattern M72: priority mux su _valid_lat. Fallback a SDRAM (main_ram_rom_data).
 always @(*) begin
-	if      (spr_DOUT_VALID)  cpu_din = spr_DOUT;             // sprite RAM (già aligned)
-	else if (ram_rd_lat)      cpu_din = byte_align(ram_rdata,        cpu_addr_lo_lat);
-	else if (shared_rd_lat)   cpu_din = byte_align(main_shared_rdata, cpu_addr_lo_lat);
-	else if (p1p2_rd_lat)     cpu_din = byte_align(p1p2_data_lat,    cpu_addr_lo_lat);
-	else if (dsw_rd_lat)      cpu_din = byte_align(dsw_data_lat,     cpu_addr_lo_lat);
-	else if (sound_rd_lat)    cpu_din = byte_align(sound_data_lat,   cpu_addr_lo_lat);
-	else                       cpu_din = byte_align(main_ram_rom_data, main_rom_addr_lo);   // fallback ROM (SDRAM)
+	if      (spr_DOUT_VALID)  cpu_din = spr_DOUT;
+	else if (ram_rd_lat)      cpu_din = ram_rdata;
+	else if (shared_rd_lat)   cpu_din = main_shared_rdata;
+	else if (p1p2_rd_lat)     cpu_din = p1p2_data_lat;
+	else if (dsw_rd_lat)      cpu_din = dsw_data_lat;
+	else if (sound_rd_lat)    cpu_din = sound_data_lat;
+	else                       cpu_din = main_ram_rom_data;   // fallback ROM (SDRAM)
 end
+
+`ifdef V30_SIM_PROBES
+// Confronto diretto con MAME sull'ATTRACT DEMO (stesso codice, nessun input,
+// deterministico). Contatore di gioco a byte 0x0040E = ram_lo[0x207].
+// MAME misurato: +44 ogni 300 frame video.
+integer af = 0;
+reg [7:0] a_prev = 0;
+reg vbl_q;
+always @(posedge clk) begin
+	vbl_q <= vblank_in;
+	if (vblank_in && !vbl_q) begin
+		af <= af + 1;
+		if (af % 60 == 0) begin
+			$display("[gameplay] frame %0d: contatore=%0d (avanzato %0d in 60 frame; MAME in gioco=60)",
+			         af, ram_lo[14'h207], (ram_lo[14'h207] - a_prev) & 8'hFF);
+			a_prev <= ram_lo[14'h207];
+		end
+	end
+end
+`endif
+
+
+
+
+`ifdef V30_SIM_PROBES
+// ── ATTESA DEL MAIN SUL SUB + CARICO ──────────────────────────────────────
+// Il main spin-aspetta il sub a FB2B7 leggendo shared [0x8000] finche' != 0.
+// Conto per frame: (a) clk in cui il main sta LEGGENDO [0x8000] in attesa
+// (ogni lettura in T3 = un giro dello spin), (b) word NON ZERO scritte dal
+// main nella lista hitbox (shared 0x8010-0x8C8F) = carico per il sub.
+// Se (a) cresce con (b) e si avvicina al frame, il rallentamento e' qui.
+integer mw_spin = 0, mw_list = 0, mw_clk = 0, mw_spinmax = 0, mw_spin_cur = 0;
+reg mw_in_spin = 0;
+always @(posedge clk) begin
+    mw_clk <= mw_clk + 1;
+    if (ce && u_cpu.u_core.t_state == 3'd3 && u_cpu.u_core.lat_type == 3'b101 &&
+        shared_memrq && cpu_addr[11:1] == 11'd0) begin
+        mw_spin <= mw_spin + 1;
+        if (main_shared_rdata != 16'd0) begin
+            if (!mw_in_spin) begin mw_in_spin <= 1'b1; mw_spin_cur <= mw_clk; end
+        end else if (mw_in_spin) begin
+            mw_in_spin <= 1'b0;
+            if (mw_clk - mw_spin_cur > mw_spinmax) mw_spinmax <= mw_clk - mw_spin_cur;
+        end
+    end
+    if (shared_memrq && cpu_wr && cpu_addr[11:1] >= 11'd8 && cpu_addr[11:1] < 11'd1608 &&
+        cpu_dout != 16'd0 && ce && u_cpu.u_core.t_state == 3'd3)
+        mw_list <= mw_list + 1;
+    if (mw_clk % 1346560 == 0 && mw_clk != 0) begin
+        $display("[mainwait] frame: letture-spin=%0d  attesa-max=%0d clk (%0d%% frame)  list-words=%0d",
+                 mw_spin, mw_spinmax, (mw_spinmax*100)/1346560, mw_list);
+        mw_spin <= 0; mw_spinmax <= 0; mw_list <= 0;
+    end
+end
+
+// LE SEI PAROLE SPORCHE del bug punteggio (dal savestate HW 17/08):
+// idx 350, 382, 670, 702, 990, 1022 = le 2 celle dopo ogni campo da 8.
+// Registro OGNI scrittura che le colpisce (indirizzo, dato, corsie) e stampo
+// il loro contenuto una volta per frame: se non vengono mai scritte lo vedo,
+// se vengono scritte male vedo con cosa.
+function automatic bit is_target(input [9:0] a);
+    is_target = (a==10'd350)||(a==10'd382)||(a==10'd670)||(a==10'd702)||(a==10'd990)||(a==10'd1022);
+endfunction
+integer wr_hits = 0, dbg_t = 0;
+reg [9:0] last_idx = 0, prev_idx = 0;
+reg [15:0] last_dat = 0, prev_dat = 0;
+reg [1:0] last_we = 0, prev_we = 0;
+reg [19:0] last_pc = 0;
+integer last_t = 0, prev_t = 0;
+always @(posedge clk) dbg_t <= dbg_t + 1;
+always @(posedge clk) begin
+    if ((txt_we_lo || txt_we_hi) && is_target(txt_idx)) begin
+        wr_hits  <= wr_hits + 1;
+        // storico: tengo le ULTIME due scritture, perche' l'ultima e' quella che resta
+        prev_idx <= last_idx; prev_dat <= last_dat; prev_we <= last_we; prev_t <= last_t;
+        last_idx <= txt_idx;  last_dat <= txt_wdata_eff;
+        last_we  <= {txt_we_hi, txt_we_lo}; last_t <= dbg_t;
+        last_pc  <= u_cpu.u_core.last_code_addr;
+        if ((wr_hits < 60) && (txt_wdata_eff == 16'h8d01)) begin
+            // cursore del gioco in work RAM: [0xac2]=X, [0xac4]=Y (byte)
+            // formula della outfunc: cella = Y*32 + (31-X)
+            $display("[chi] idx=%0d atteso=%0d dato=%04h pc=%05h X=%0d Y=%0d",
+                     txt_idx,
+                     (ram_lo[14'h562] * 32) + (31 - ram_lo[14'h561]),
+                     txt_wdata_eff, u_cpu.u_core.last_code_addr,
+                     ram_lo[14'h561], ram_lo[14'h562]);
+        end
+    end
+end
+reg vb_d;
+always @(posedge clk) begin
+    vb_d <= vblank_in;
+    if (vblank_in && !vb_d)
+        $display("[ult] ultima: idx=%0d dato=%04h we=%b @%0d | penultima: idx=%0d dato=%04h we=%b @%0d",
+                 last_idx, last_dat, last_we, last_t, prev_idx, prev_dat, prev_we, prev_t);
+        $display("[sei] 350=%02h/%02h 382=%02h/%02h 670=%02h/%02h 702=%02h/%02h 990=%02h/%02h 1022=%02h/%02h  scritture=%0d",
+                 txt_lo[350],txt_hi[350], txt_lo[382],txt_hi[382], txt_lo[670],txt_hi[670],
+                 txt_lo[702],txt_hi[702], txt_lo[990],txt_hi[990], txt_lo[1022],txt_hi[1022], wr_hits);
+end
+`endif
 
 endmodule

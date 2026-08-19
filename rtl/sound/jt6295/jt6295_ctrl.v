@@ -35,6 +35,15 @@ module jt6295_ctrl(
     input                  rom_ok,
     // flow control
     output reg [ 3:0]      start,
+    // [Raiden 2026-08-14] maschera del canale COMANDATO ma non ancora avviato:
+    // fra il 2o byte (che porta la maschera) e l'avvio effettivo passano 6
+    // letture della tabella indirizzi dalla ROM. Il chip REALE marca la voce
+    // come suonante GIA' al 2o byte (MAME okim6295_device::write ->
+    // m_voice[].m_playing = true, e read() ritorna 0xf0 | playing). Senza
+    // questo, la lettura di stato in quella finestra dice "canale libero" e il
+    // driver del gioco assegna il suono a un ALTRO canale (batteria che di
+    // solito sta sul canale 2 parte sul 3, con entrambi che suonano).
+    output     [ 3:0]      pending,
     output reg [ 3:0]      stop,
     input      [ 3:0]      busy,
     input      [ 3:0]      ack,
@@ -88,7 +97,11 @@ always @(posedge clk) begin
         new_att  <= 0;
     end else begin
         if( cen4 ) begin
-            stop <= stop & busy;
+            // [Raiden 2026-08-14] era `stop & busy`: uno stop comandato mentre
+            // il canale e' ancora nella finestra di avvio (comando latchato ma
+            // 6 letture ROM non finite -> busy=0) veniva CANCELLATO prima di
+            // fare effetto. Ora sopravvive anche sul canale in avvio.
+            stop <= stop & (busy | pending);
         end
         if( push ) pull <= 1'b0;
         if( negedge_wrn  ) begin // new write
@@ -97,11 +110,20 @@ always @(posedge clk) begin
                 new_att <= din[3:0];
                 cmd     <= 1'b0;
                 pull    <= 1'b1;
+                // solo i canali che si stanno (ri)avviando perdono lo stop
+                stop    <= stop & ~din[7:4];
             end
             else if( din[7] ) begin // channel start
                 phrase <= din[6:0];
                 cmd    <= 1'b1; // wait for second byte
-                stop   <= 4'd0;
+                // [Raiden 2026-08-14] RIMOSSO `stop <= 4'd0`: il primo byte di
+                // uno START azzerava TUTTI gli stop pendenti, anche di canali
+                // diversi. Al loop della musica il gioco ferma i canali e
+                // subito dopo lancia i nuovi suoni -> lo stop veniva cancellato
+                // -> la vecchia batteria CONTINUAVA mentre la nuova partiva su
+                // un altro canale (canali 2 e 3 con due batterie diverse).
+                // Sul chip reale (MAME okim6295_device::write) lo stop e'
+                // IMMEDIATO e nessun comando successivo puo' annullarlo.
             end else begin // stop data
                 stop   <= din[6:3];
             end
@@ -115,6 +137,8 @@ reg [ 2:0] st, addr_lsb;
 reg        wrom;
 
 assign rom_addr = { phrase, addr_lsb };
+// comando in volo: dal 2o byte (pull) fino all'avvio effettivo (st==6 -> start)
+assign pending  = (pull | push) ? ch : 4'd0;
 
 // Request phrase address
 always @(posedge clk) begin

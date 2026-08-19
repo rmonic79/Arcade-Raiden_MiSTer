@@ -168,6 +168,14 @@ always @(posedge clk_sys) begin
 			paused_safe_r <= 1'b1;
 		else if (VBlank && !vblank_prev_safe)
 			paused_safe_r <= pause | ss_mgr_pause;
+		// RELEASE post-LOAD: il save avviene DENTRO il vblank -> il restore
+		// riporta il video timing dentro il vblank e la pausa lo tiene fermo
+		// -> VBlank resta alto FISSO -> il fronte di salita non arriva mai ->
+		// pausa eterna (deadlock trovato in sim scene; vale anche su HW: il
+		// SAVE non lo soffre perche' non ripristina il video). Rilascio anche
+		// a VBlank a LIVELLO: siamo comunque al confine frame, stessa garanzia.
+		else if (paused_safe_r && VBlank && !pause && !ss_mgr_pause)
+			paused_safe_r <= 1'b0;
 	end
 end
 wire paused_safe = paused_safe_r;
@@ -177,8 +185,6 @@ assign HDMI_BOB_DEINT = 0;
 
 assign AUDIO_S = 1;  // signed audio
 wire signed [15:0] game_audio_l, game_audio_r;
-assign AUDIO_L = game_audio_l;
-assign AUDIO_R = game_audio_r;
 assign AUDIO_MIX = 0;
 
 assign LED_DISK = 0;
@@ -204,15 +210,15 @@ wire signed [9:0] osd_txt_yoff = 10'sd0;
 wire signed [9:0] osd_bg_xoff  = osd_l0_xoff;
 wire signed [9:0] osd_bg_yoff  = osd_l0_yoff;
 
+wire [21:0] gamma_bus;   // OSD framework <-> gamma_fast (inout, decodifica interna)
 `include "build_id.v"
 localparam CONF_STR = {
 	"Raiden;SS3E000000:200000;",
 	"-;",
-	// [PUBLIC] Savestate nascosto dall'OSD finché non fixiamo l'audio SS — riattivare togliendo i commenti:
-	//"O[106:105],Savestate Slot,1,2,3,4;",
-	//"R[107],Save state (Alt-F1);",
-	//"R[108],Restore state (F1);",
-	//"-;",
+	"O[106:105],Savestate Slot,1,2,3,4;",
+	"R[107],Save state (Alt-F1);",
+	"R[108],Restore state (F1);",
+	"-;",
 	"P1,Video;",
 	"P1O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"P1O[7:5],Scale,Normal,V-Integer,HV-Integer,Narrower HV-Integer;",
@@ -230,8 +236,22 @@ localparam CONF_STR = {
 	"DIP;",
 	"-;",
 	"P3,Audio;",
+	"O[83],Audio Filter,On,Off;",
 	"P3O[87:84],FM Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
 	"P3O[91:88],ADPCM Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[70:67],OKI Ch1 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[74:71],OKI Ch2 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[78:75],OKI Ch3 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[82:79],OKI Ch4 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[11:8],FM Ch1 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[15:12],FM Ch2 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[23:20],FM Ch3 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[27:24],FM Ch4 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[39:36],FM Ch5 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[43:40],FM Ch6 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[47:44],FM Ch7 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[51:48],FM Ch8 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[55:52],FM Ch9 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -261,7 +281,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
 	.EXT_BUS(),
-	.gamma_bus(),
+	.gamma_bus(gamma_bus),
 	.forced_scandoubler(forced_scandoubler),
 	.buttons(buttons),
 	.status(status),
@@ -382,6 +402,16 @@ always @(posedge clk_sys) begin
 	else if (reset_hold_cnt != 22'd0) reset_hold_cnt <= reset_hold_cnt - 22'd1;
 end
 wire reset = (reset_hold_cnt != 22'd0);
+`ifdef V30_SIM_PROBES
+// spia sim: quale sorgente tiene il reset (RESET, OSD, ~pll_locked, download)
+integer dbg_rst_c = 0;
+always @(posedge clk_sys) begin
+	dbg_rst_c <= dbg_rst_c + 1;
+	if (dbg_rst_c % 500000 == 0)
+		$display("[rst] clk%0d reset=%b RESET=%b osd=%b btn=%b pll=%b dl=%b",
+		         dbg_rst_c, reset, RESET, status[0], buttons[1], pll_locked, ioctl_download);
+end
+`endif
 // Bridge reset: ONLY pll_locked — bridge must run during download
 // (revert dd86f8b: includere user reset causa mismatch sdram_ack/sdram_req,
 // SDRAM controller non si resetta → bridge in reset vs SDRAM running → stuck)
@@ -426,7 +456,13 @@ sdram sdram_ctrl
 
 	.init(~pll_locked),
 	.clk(clk_sys),
-	.prio_mode(status[35:34]),
+	// CPU-first FISSO (mode 2), sicuro per costruzione: 2 V30 = max 1 txn/32clk
+	// l'uno (ciclo bus 4T@10MHz) = max 50% slot SDRAM anche a miss 100%; il video
+	// worst-case usa ~25-31% della scanline -> mai affamato (margine ~2x). Con
+	// le CPU 0-wait anche sui miss spariscono i rallentamenti (assenti su PCB)
+	// -> niente sfasamenti main<->sub -> niente leak sprite. (status[35:34] era
+	// senza voce OSD = morto.)
+	.prio_mode(2'd2),
 	.ready(sdram_ready),
 
 	.addr0(sd_addr0), .wrl0(sd_wrl0), .wrh0(sd_wrh0),
@@ -454,53 +490,47 @@ wire [15:0] game_main_data, game_sub_data;
 // Audio Z80 ROM removed from SDRAM — will use BRAM when audio implemented
 wire        game_main_ready, game_sub_ready;
 
-// BYPASS rom_cache (pattern WonderSwan_MiSTer): CPU bus_read direttamente sul
-// bridge SDRAM. WonderSwan non usa cache — sdram controller registra dout, dato
-// stabile fino al prossimo accesso. La cache introduceva 1 ciclo di latenza
-// extra + cpu_ready pulse 1 ciclo che la CPU V30 (10 MHz → ~9 cicli clk_sys
-// per ce) poteva facilmente perdere.
-wire [23:0] bridge_main_addr = game_main_addr;
-wire        bridge_main_req  = game_main_req;
+// (Storico: il vecchio bypass "pattern WonderSwan" era di un'era pre-latch-FSM;
+// oggi il ricevitore Main latcha il ready-pulse come il Sub -> cache ok.)
+// MAIN ROM via rom_cache (come il Sub): senza cache il Main fetcha DIRETTO da
+// SDRAM in arbitraggio contro grafica+OKI+miss Sub -> nelle scene pesanti viene
+// AFFAMATO -> rallentamenti (che MAME non ha) -> sfasamento timing main<->sub
+// -> leak slot sprite (i bug avvengono DURANTE i rallentamenti, verificato HW).
+// Il ricevitore Main ha lo stesso latch-FSM del Sub (main_top:128-152 =
+// sub_top:112-134): protocollo ready-pulse gia' provato con la cache su HW.
+wire [23:0] bridge_main_addr;
+wire        bridge_main_req;
 wire [15:0] bridge_main_data;
 wire        bridge_main_ready;
-assign game_main_data  = bridge_main_data;
-assign game_main_ready = bridge_main_ready;
+rom_cache #(.CACHE_BITS(13)) u_main_cache (
+	.clk(clk_sys), .reset(bridge_reset),
+	.cpu_addr(game_main_addr), .cpu_req(game_main_req),
+	.cpu_data(game_main_data), .cpu_ready(game_main_ready),
+	.sdram_addr(bridge_main_addr), .sdram_req(bridge_main_req),
+	.sdram_data(bridge_main_data), .sdram_ready(bridge_main_ready)
+);
 
-// SUB ROM in BRAM (256KB = 128K word). Caricata da ioctl_download nel range
-// MRA byte $060000-$09FFFF. Tenere bridge_sub_* connesso per compatibilità
-// ma SCOLLEGATO dal bridge SDRAM (Sub legge da BRAM diretta).
-wire [23:0] bridge_sub_addr = 24'd0;
-wire        bridge_sub_req  = 1'b0;
-wire [15:0] bridge_sub_data_unused;
-wire        bridge_sub_ready_unused;
+// SUB ROM in SDRAM (porta 2), non piu' in BRAM. Il download scrive gia' tutto
+// in SDRAM (Sub @ word offset SUB_BASE=0x030000); il Sub V30 legge via bridge
+// come il Main (READY/Tw per la latenza SDRAM). Rimosso il duplicato BRAM
+// (256KB = ~205 M10K liberati).
+wire [15:0] bridge_sub_data;
+wire        bridge_sub_ready;
+wire [23:0] sub_cache_sdram_addr;
+wire        sub_cache_sdram_req;
 
-// Sub ROM BRAM 256KB (split lo/hi byte 8-bit per inferenza M10K)
-(* ramstyle = "M10K,no_rw_check" *) reg [7:0] sub_rom_lo [0:131071];
-(* ramstyle = "M10K,no_rw_check" *) reg [7:0] sub_rom_hi [0:131071];
-
-// Download Sub ROM: range MRA byte $060000-$09FFFF (256KB)
-// word index = (byte_addr - $060000) / 2 = ioctl_addr[17:1] - $30000
-wire        sub_dl_wr     = ioctl_download && ioctl_wr && (ioctl_index == 16'd0) &&
-                             (ioctl_addr >= 27'h060000) && (ioctl_addr < 27'h0A0000);
-wire [16:0] sub_dl_offset = ioctl_addr[17:1] - 17'h30000;
-always @(posedge clk_sys) begin
-	if (sub_dl_wr) begin
-		sub_rom_lo[sub_dl_offset] <= ioctl_dout[7:0];
-		sub_rom_hi[sub_dl_offset] <= ioctl_dout[15:8];
-	end
-end
-
-// Read porta CPU Sub (word-aligned)
-reg [15:0] sub_bram_rdata;
-wire [16:0] sub_word_idx = game_sub_addr[17:1];  // 17-bit word idx → 128K word
-always @(posedge clk_sys) begin
-	sub_bram_rdata <= {sub_rom_hi[sub_word_idx], sub_rom_lo[sub_word_idx]};
-end
-// ready: 1 ciclo dopo cpu_req (BRAM 1-cycle latency).
-reg sub_req_d;
-always @(posedge clk_sys) sub_req_d <= game_sub_req;
-assign game_sub_data  = sub_bram_rdata;
-assign game_sub_ready = sub_req_d;
+// rom_cache: la maggior parte dei fetch del Sub in 1 ciclo (niente SDRAM) ->
+// il Sub non ruba banda alla grafica -> niente nero da contesa.
+// CACHE_BITS 13 = 16KB (8192x16): miss rarissimi -> timing Sub quasi-BRAM.
+// Con 9 (1KB) il thrash nelle scene pesanti rallentava/jitterava il Sub ->
+// race mailbox main<->sub -> leak slot sprite (detriti fissi a schermo, stage 3).
+rom_cache #(.CACHE_BITS(13)) u_sub_cache (
+	.clk(clk_sys), .reset(bridge_reset),
+	.cpu_addr(game_sub_addr), .cpu_req(game_sub_req),
+	.cpu_data(game_sub_data), .cpu_ready(game_sub_ready),
+	.sdram_addr(sub_cache_sdram_addr), .sdram_req(sub_cache_sdram_req),
+	.sdram_data(bridge_sub_data), .sdram_ready(bridge_sub_ready)
+);
 
 sdram_bridge bridge
 (
@@ -529,11 +559,11 @@ sdram_bridge bridge
 	.main_data(bridge_main_data),
 	.main_ready(bridge_main_ready),
 
-	// Sub V30 ROM ora in BRAM (vedi sopra), porta bridge SDRAM scollegata.
-	.sub_byte_addr(bridge_sub_addr),
-	.sub_req(bridge_sub_req),
-	.sub_data(bridge_sub_data_unused),
-	.sub_ready(bridge_sub_ready_unused),
+	// Sub V30 ROM in SDRAM (porta 2) via rom_cache.
+	.sub_byte_addr(sub_cache_sdram_addr),
+	.sub_req(sub_cache_sdram_req),
+	.sub_data(bridge_sub_data),
+	.sub_ready(bridge_sub_ready),
 
 	// OKI ADPCM ROM (port 3)
 	.oki_byte_addr(oki_rom_addr),
@@ -670,13 +700,26 @@ assign pal_b_b = {pal_b4, pal_b4};
 // MRA layout audiocpu: 0x0A0000-0x0AFFFF (64KB raw byte-pack)
 // OKI ROM: SDRAM @ OKI_BASE (oki_rom_addr/data/ok via SDRAM bridge)
 // Coin button (joy[11]) → Z80 0x4013 → sub2main → main 0xA0004 → coin_credit
-Raiden_audio_z80 #(.SS_IDX_ZRAM(10)) u_audio (
+Raiden_audio_z80 #(.SS_IDX_ZRAM(10), .SS_IDX_Z80(12), .SS_IDX_YMSH(13), .SS_IDX_GLUE(14)) u_audio (
 	.clk           (clk_sys),
 	.reset         (reset),
 	.pause         (paused_safe),
 	.clk_sel       (2'd0),         // legacy, ignored
 	.fm_vol_sel    (status[87:84]),
 	.oki_vol_sel   (status[91:88]),
+	.oki_ch_vol_sel0 (status[70:67]),
+	.oki_ch_vol_sel1 (status[74:71]),
+	.oki_ch_vol_sel2 (status[78:75]),
+	.oki_ch_vol_sel3 (status[82:79]),
+	.fm_ch_vol_sel0 (status[11:8]),
+	.fm_ch_vol_sel1 (status[15:12]),
+	.fm_ch_vol_sel2 (status[23:20]),
+	.fm_ch_vol_sel3 (status[27:24]),
+	.fm_ch_vol_sel4 (status[39:36]),
+	.fm_ch_vol_sel5 (status[43:40]),
+	.fm_ch_vol_sel6 (status[47:44]),
+	.fm_ch_vol_sel7 (status[51:48]),
+	.fm_ch_vol_sel8 (status[55:52]),
 	.ioctl_download(ioctl_download),
 	.ioctl_wr      (ioctl_wr),
 	.ioctl_addr    (ioctl_addr),
@@ -695,8 +738,82 @@ Raiden_audio_z80 #(.SS_IDX_ZRAM(10)) u_audio (
 	.oki_rom_ok    (oki_rom_ok),
 	.audio_l       (game_audio_l),
 	.audio_r       (game_audio_r),
-	.ss_zram       (ssb[10])
+	.ss_zram       (ssb[10]),
+	.ss_z80        (ssb[12]),
+	.ss_ymsh       (ssb[13]),
+	.ss_glue       (ssb[14]),
+	.z80_ss_ready  (z80_ss_ready)
 );
+
+// ─── FILTRO DI USCITA (Arcade LPF 6 kHz 2nd order) ───────────────────────
+// L'uscita del MiSTer e' piatta; il PCB reale ha uno stadio analogico che
+// taglia gli alti. La curva scelta confrontando con le registrazioni dalla
+// scheda e' "Arcade LPF 6khz 2nd.txt" dei filtri di sistema, qui CUCITA
+// nell'RTL cosi' ogni utente ce l'ha di serie senza file esterni.
+// Voce OSD "Audio Filter" On/Off: status[83]=0 -> On (default).
+//
+// Coefficienti presi dal file, invariati:
+//   Sampling Frequency 7056000 ; Base gain 0.00003952949005309181
+//   X0=2  X1=1  X2=0 ; Y0=-1.99244411238133389830 ; Y1=0.99247255086338648233
+// (il file non ha Y2 -> 0)
+//
+// Il `ce` e' generato con LO STESSO accumulatore del framework
+// (sys/audio_out.v: cnt += flt_rate*2, confronto con CLK_RATE), quindi la
+// frequenza media e' identica e la risposta e' la stessa, non un'approssimazione.
+localparam [31:0] FLT_RATE_HZ = 32'd7056000;   // Sampling Frequency del file
+localparam [31:0] CLK_RATE_HZ = 32'd80000000;  // clk_sys
+
+reg flt_ce;
+always @(posedge clk_sys) begin
+	reg [31:0] flt_cnt = 0;
+	flt_ce  = 0;
+	flt_cnt = flt_cnt + {FLT_RATE_HZ[30:0], 1'b0};
+	if (flt_cnt >= CLK_RATE_HZ) begin
+		flt_cnt = flt_cnt - CLK_RATE_HZ;
+		flt_ce  = 1;
+	end
+end
+
+// sample_ce = frequenza di uscita del filtro (48 kHz), stesso metodo
+localparam [31:0] SND_RATE_HZ = 32'd48000;
+reg snd_ce;
+always @(posedge clk_sys) begin
+	reg [31:0] snd_cnt = 0;
+	snd_ce  = 0;
+	snd_cnt = snd_cnt + SND_RATE_HZ;
+	if (snd_cnt >= CLK_RATE_HZ) begin
+		snd_cnt = snd_cnt - CLK_RATE_HZ;
+		snd_ce  = 1;
+	end
+end
+
+wire [15:0] flt_audio_l, flt_audio_r;
+IIR_filter #(
+	.use_params(1),
+	.stereo    (1),
+	.coeff_x   (0.00003952949005309181),
+	.coeff_x0  (2),
+	.coeff_x1  (1),
+	.coeff_x2  (0),
+	.coeff_y0  (-1.99244411238133389830),
+	.coeff_y1  (0.99247255086338648233),
+	.coeff_y2  (0)
+) u_audio_lpf (
+	.clk      (clk_sys),
+	.reset    (reset),
+	.ce       (flt_ce),
+	.sample_ce(snd_ce),
+	.cx (40'd0), .cx0(8'd0), .cx1(8'd0), .cx2(8'd0),
+	.cy0(24'd0), .cy1(24'd0), .cy2(24'd0),
+	.input_l  (game_audio_l),
+	.input_r  (game_audio_r),
+	.output_l (flt_audio_l),
+	.output_r (flt_audio_r)
+);
+
+wire audio_filter_off = status[83];
+assign AUDIO_L = audio_filter_off ? game_audio_l : flt_audio_l;
+assign AUDIO_R = audio_filter_off ? game_audio_r : flt_audio_r;
 
 // ── Isolatore OSD → CPU (2-FF sync, attributi preserve). ──
 // Aggiungere bit OSD altrove NON destabilizza più le CPU.
@@ -720,9 +837,10 @@ raiden_osd_iso u_osd_iso (
 // continua a girare finché non raggiunge CPUSTAGE_IDLE (cpu_idle=1), POI si
 // congela (park). La cattura SS parte solo quando ENTRAMBE sono a confine.
 wire main_cpu_idle, sub_cpu_idle;
+wire z80_ss_ready;
 wire main_cpu_pause = pause_iso & main_cpu_idle;   // gira finché non è idle, poi park
 wire sub_cpu_pause  = pause_iso & sub_cpu_idle;
-wire cpus_ss_ready  = main_cpu_idle & sub_cpu_idle; // entrambe a confine = cattura sicura
+wire cpus_ss_ready  = main_cpu_idle & sub_cpu_idle & z80_ss_ready; // TUTTE le CPU a confine = cattura sicura
 
 // ── Main V30 (raiden_state::main_map) ──
 Raiden_main_top #(.SS_IDX_SPR(7), .SS_IDX_CPU(8)) u_main (
@@ -1029,7 +1147,7 @@ ddr_if ddr_ss();      // savestate client (memory_stream) → gate → pin
 localparam SS_IDX_WORKRAM = 0;   // main work RAM (ram_lo/hi) — contiene lo score
 // slave: 0=workram,1=txt,2=scroll; 3=shared; 4=bg,5=fg,6=pal; 7=sprite;
 // 8=V30 main regs; 9=V30 sub regs; 10=z80_ram; 11=Sub work RAM.
-localparam SS_NSLAVES     = 12;
+localparam SS_NSLAVES     = 15;  // 12=regs Z80 (T80s REG/DIR), 13=shadow YM3812, 14=glue audio (ULTIMO: commit=replay)
 localparam SS_MS_COUNT    = 16;  // memory_stream COUNT (>= SS_NSLAVES, pot. di 2)
 
 // ss_busy dichiarato sopra (vicino a paused_safe che lo usa)
@@ -1245,8 +1363,14 @@ always @(posedge clk_sys) begin
 	end
 end
 wire [10:0] backdrop_pen = 11'h000;
+`ifdef V30_SIM_NOSPR
+// Isolamento layer (solo sim): sprite spenti -> cosa resta e' BG/FG/TXT.
+wire spr_above_fg = 1'b0;
+wire spr_above_bg = 1'b0;
+`else
 wire spr_above_fg = spr_opaque & (spr_pri >= 2'd2);   // pri=2,3 sopra FG
 wire spr_above_bg = spr_opaque & (spr_pri == 2'd1);   // pri=1 sopra BG (sotto FG)
+`endif
 
 // OSD palette base override: i 2 bit [9:8] del pen_index = palette region (256 entry).
 // Renderer originale produce: BG=0x0xx, FG=0x1xx, SPR=0x2xx, TXT=0x3xx.
@@ -1423,12 +1547,51 @@ always @(posedge clk_sys) begin
 end
 
 // Output analogico: H-Size attivo → dal modulo (incorpora shift); bypass → shiftato.
-assign VGA_R  = hsize_active ? str_r  : av_r;
-assign VGA_G  = hsize_active ? str_g  : av_g;
-assign VGA_B  = hsize_active ? str_b  : av_b;
-assign VGA_HS = hsize_active ? str_hs : vga_hs_reg;
-assign VGA_VS = hsize_active ? str_vs : vga_vs_reg;
-assign CE_PIXEL = hsize_active ? rd_ce : ce_pix;
+// ─── GAMMA CORRECTION (gamma_fast) ───────────────────────────────────────
+// Il core non usa video_mixer, quindi la gamma va agganciata a mano: `gamma_bus`
+// era scollegata e nessun correttore era istanziato -> la voce OSD non faceva
+// nulla.
+// Usato gamma_fast e NON gamma_corr: prende `gamma_bus` come inout e lo
+// decodifica da solo (niente spacchettamento a mano, che avevo sbagliato di un
+// bit), ha tre LUT parallele lette in un colpo invece della sequenza a 3 cicli,
+// e ha gia' DE in ingresso e in uscita, che e' quello che serve qui.
+// Sta DOPO il mux hsize_active, cosi' i due rami (modulo CRT `str_*` e percorso
+// diretto `av_*`) prendono lo stesso ritardo. RGB e sync escono ritardati
+// INSIEME, quindi la posizione dell'immagine rispetto al sync non cambia.
+wire [7:0] vid_r_pre  = hsize_active ? str_r  : av_r;
+wire [7:0] vid_g_pre  = hsize_active ? str_g  : av_g;
+wire [7:0] vid_b_pre  = hsize_active ? str_b  : av_b;
+wire       vid_hs_pre = hsize_active ? str_hs : vga_hs_reg;
+wire       vid_vs_pre = hsize_active ? str_vs : vga_vs_reg;
+wire       vid_de_pre = hsize_active ? de_osd : ~(HBlank | VBlank);
+wire       vid_ce_pix = hsize_active ? rd_ce  : ce_pix;
+
+wire [23:0] vid_rgb_out;
+wire        vid_hs_out, vid_vs_out, vid_de_out;
+gamma_fast u_gamma (
+	.clk_vid   (clk_sys),
+	.ce_pix    (vid_ce_pix),
+	.gamma_bus (gamma_bus),
+	.HSync     (vid_hs_pre),
+	.VSync     (vid_vs_pre),
+	.HBlank    (~vid_de_pre),
+	.VBlank    (1'b0),
+	.DE        (vid_de_pre),
+	.RGB_in    ({vid_r_pre, vid_g_pre, vid_b_pre}),
+	.HSync_out (vid_hs_out),
+	.VSync_out (vid_vs_out),
+	.HBlank_out(),
+	.VBlank_out(),
+	.DE_out    (vid_de_out),
+	.RGB_out   (vid_rgb_out)
+);
+
+assign VGA_R  = vid_rgb_out[23:16];
+assign VGA_G  = vid_rgb_out[15:8];
+assign VGA_B  = vid_rgb_out[7:0];
+assign VGA_HS = vid_hs_out;
+assign VGA_VS = vid_vs_out;
+assign CE_PIXEL = vid_ce_pix;
 
 // Aspect ratio: Original = 4:3 arcade display, Full Screen = 0:0.
 // Quando ruota (TATE) swap ARX/ARY: la scena è già ruotata dal framebuffer
@@ -1448,7 +1611,7 @@ video_freak video_freak
 	.VGA_DE(VGA_DE),
 	.VIDEO_ARX(VIDEO_ARX),
 	.VIDEO_ARY(VIDEO_ARY),
-	.VGA_DE_IN(hsize_active ? de_osd : ~(HBlank | VBlank)),
+	.VGA_DE_IN(vid_de_out),
 	.ARX(arx),
 	.ARY(ary),
 	.CROP_SIZE(12'd0),
@@ -1474,7 +1637,13 @@ wire rotate_ccw = (rotate_sel == 2'd1);
 wire flip_180   = status[3];
 wire video_rotated;
 
-assign VGA_SCALER = video_rotated;
+// VGA_SCALER deve restare 0: il CRT analogico non deve MAI cambiare routing
+// quando attivi rotate. La rotazione HDMI e' gestita da screen_rotate via
+// framebuffer HPS, NON tramite VGA_SCALER. Pattern gia' applicato in
+// SkySmasher (SkySmasher.sv:149-153) e mai portato qui: con VGA_SCALER
+// legato a video_rotated, abilitare la rotazione dirottava anche l'uscita
+// analogica.
+assign VGA_SCALER = 0;
 
 wire [28:0] rot_addr;
 wire [63:0] rot_data;
@@ -1525,5 +1694,96 @@ raiden_rotate_fifo u_rot_fifo (
 	.rot_we   (rot_we),
 	.ddr      (ddr_rot)
 );
+
+`ifdef V30_SIM_PROBES
+// Probe MIXER: chi disegna il pixel (x,y) scelto? Stampa una riga per frame
+// con lo stato di TUTTI i layer nel punto = identifica il colpevole del blocco.
+integer dbg_px_n = 0;
+always @(posedge clk_sys) begin
+	if (ce_pix && video_de && dbg_px_n < 30 &&
+	    ((hpos_for_read == 10'd220 && vpos_for_pf == 9'd80) ||
+	     (hpos_for_read == 10'd180 && vpos_for_pf == 9'd140))) begin
+		dbg_px_n <= dbg_px_n + 1;
+		$display("[mix] x=%0d y=%0d | txt=%b(%03h) sprA=%b sprB=%b spr(op=%b pri=%0d pen=%03h) fg=%b(%03h) bg=%b(%03h)",
+		         hpos_for_read, vpos_for_pf, text_opaque, text_pen,
+		         spr_above_fg, spr_above_bg, spr_opaque, spr_pri, spr_pen,
+		         fg_opaque, fg_pen, bg_opaque, bg_pen);
+	end
+end
+`endif
+
+`ifdef V30_SIM_PROBES
+// Probe savestate (scene): comando OSD -> ss_ui -> manager -> DMA.
+reg dbg_ssl_p, dbg_ssb_p, dbg_ssmp_p;
+integer dbg_hb = 0;
+integer dbg_ss_dur = 0;
+integer dbg_mgr_dur = 0;
+integer dbg_gate_tr = 0;
+reg dbg_post_tr = 0;
+always @(posedge clk_sys) begin
+	dbg_ssl_p <= ss_load;
+	dbg_ssb_p <= ss_busy;
+	if (ss_load && !dbg_ssl_p)  $display("[ssui] ss_load EDGE (slot=%0d) status108=%b status107=%b", ss_slot, status[108], status[107]);
+	if (ss_mgr_pause && !dbg_ssmp_p) $display("[ssui] ss_mgr_pause ALTO");
+	dbg_ssmp_p <= ss_mgr_pause;
+	if (ss_mgr_pause && (dbg_hb % 500000) == 0)
+		$display("[ssui] wait: paused_safe=%b main_idle=%b sub_idle=%b z80_rdy=%b", paused_safe, main_cpu_idle, sub_cpu_idle, z80_ss_ready);
+	if (ss_busy && !dbg_ssb_p) dbg_gate_tr <= 40;
+	if (!ss_busy && dbg_ssb_p) dbg_post_tr <= 1;
+	if (dbg_post_tr && (dbg_hb % 200000) == 0)
+		$display("[sspost] mgr_pause=%b paused_safe=%b reload=%b main_idle=%b sub_idle=%b", ss_mgr_pause, paused_safe, ss_cpu_reload, main_cpu_idle, sub_cpu_idle);
+	if (dbg_gate_tr > 0) begin
+		dbg_gate_tr <= dbg_gate_tr - 1;
+		$display("[ssgate] t-%0d hold=%b grant=%b infl=%b rd=%b addr=%h rdy=%b rdata=%h", dbg_gate_tr, ss_hold, ss_ddr_grant, ss_tx_inflight, ddr_ss.read, ddr_ss.addr, ddr_ss.rdata_ready, ddr_ss.rdata[31:0]);
+	end
+	dbg_hb <= dbg_hb + 1;
+	if (ss_save)                $display("[ssui] ss_save alto!");
+	if (ss_busy != dbg_ssb_p)   $display("[ssui] ss_busy=%b", ss_busy);
+	// durata di ogni operazione SS: un save che non si chiude non stampa mai
+	if (ss_busy && !dbg_ssb_p) dbg_ss_dur <= 0;
+	else if (ss_busy) dbg_ss_dur <= dbg_ss_dur + 1;
+	else if (!ss_busy && dbg_ssb_p) $display("[ssdur] operazione SS completata in %0d clk", dbg_ss_dur);
+	// watchdog: se il manager tiene la pausa troppo a lungo = DEADLOCK
+	if (ss_mgr_pause) dbg_mgr_dur <= dbg_mgr_dur + 1;
+	else dbg_mgr_dur <= 0;
+	if (dbg_mgr_dur == 32'd4000000)
+		$display("[SSDEADLOCK] pausa SS bloccata >4M clk: paused_safe=%b main_idle=%b sub_idle=%b z80=%b busy=%b",
+		         paused_safe, main_cpu_idle, sub_cpu_idle, z80_ss_ready, ss_busy);
+end
+`endif
+
+`ifdef V30_SIM_PROBES
+// Probe boot-gate (switch --define V30_SIM_PROBES=1): catena main ROM CPU->cache->bridge->porta1 SDRAM.
+integer dbg_mr_ev = 0;
+reg dbg_gmr_p, dbg_bmr_p, dbg_r1_p, dbg_a1_p;
+always @(posedge clk_sys) begin
+	dbg_gmr_p <= game_main_req;
+	dbg_bmr_p <= bridge_main_req;
+	dbg_r1_p  <= sd_req1;
+	dbg_a1_p  <= sd_ack1;
+	if (dbg_mr_ev < 80) begin
+		if (game_main_req != dbg_gmr_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] game_req=%b addr=%h (sdram_ready=%b)", game_main_req, game_main_addr, sdram_ready);
+		end
+		if (game_main_ready) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] game_READY data=%h addr=%h", game_main_data, game_main_addr);
+		end
+		if (bridge_main_req != dbg_bmr_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] bridge_req=%b addr=%h", bridge_main_req, bridge_main_addr);
+		end
+		if (bridge_main_ready) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] bridge_READY data=%h", bridge_main_data);
+		end
+		if (sd_req1 != dbg_r1_p || sd_ack1 != dbg_a1_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] port1 req=%b ack=%b addr=%h", sd_req1, sd_ack1, sd_addr1);
+		end
+	end
+end
+`endif
 
 endmodule

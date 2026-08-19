@@ -107,10 +107,18 @@ assign zero     = ch[0];
 assign update   = up_start | up_stop;
 assign cont     = busy_out & ~over;
 assign cnt_next = cont      ? cnt+19'd1 : cnt;
-assign stop_in  = up_start  ? stop_addr : stop_out;
-assign cnt_in   = up_start  ? {start_addr, 1'b0} : cnt_next;
-assign att_in   = up_start  ? att : att_out;
-assign busy_in  = update    ? (up_start & ~up_stop) : cont;
+// MAME-accurate (okim6295.cpp:251 "if (!voice.m_playing)"): un start su voce
+// ANCORA BUSY viene IGNORATO, come il chip reale. Prima veniva accettato:
+// la voce ripartiva senza reset del predittore ADPCM (che si azzera solo
+// quando busy scende) -> ampiezze sbagliate + campioni sovrapposti/doppi
+// (es. due batterie una sull'altra). Con la guard, lo start e' accettato solo
+// a voce libera -> il reset del predittore (en=0) scatta sempre prima.
+wire acc_start  = up_start & ~busy_out;
+assign stop_in  = acc_start ? stop_addr : stop_out;
+assign cnt_in   = acc_start ? {start_addr, 1'b0} : cnt_next;
+assign att_in   = acc_start ? att : att_out;
+assign busy_in  = up_stop   ? 1'b0 :
+                  acc_start ? 1'b1 : cont;
 
 wire [CSRW-1:0] csr_in, csr_out;
 assign csr_in = { stop_in, cnt_in, att_in, busy_in };

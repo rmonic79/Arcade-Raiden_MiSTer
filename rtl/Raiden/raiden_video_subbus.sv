@@ -61,10 +61,9 @@ wire [9:0]  bg_word_addr  = cpu_addr[10:1];   // bgram 1K word
 wire [9:0]  fg_word_addr  = cpu_addr[10:1];   // fgram 1K word
 wire [10:0] pal_word_addr = cpu_addr[11:1];   // palram 2K word
 
-// Byte enable decode (V30 standard: be=01 byte, be=11 word)
-wire wr_lo = cpu_wr && cpu_be[0] && !cpu_be[1] && !cpu_addr[0];
-wire wr_hi = cpu_wr && cpu_be[0] && !cpu_be[1] &&  cpu_addr[0];
-wire wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
+// M72-native byte lanes: cpu_be[0]=lane bassa, cpu_be[1]=lane alta; cpu_dout già allineato.
+wire cpu_we_lo = cpu_wr && cpu_be[0];
+wire cpu_we_hi = cpu_wr && cpu_be[1];
 
 // ─── BG RAM 2KB (1K word) ────────────────────────────────────────────────
 // Split lo/hi byte BRAM per byte-enable. Porta A = CPU R/W, Porta B = renderer R.
@@ -73,9 +72,9 @@ wire wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
 initial begin integer i; for (i=0; i<1024; i=i+1) begin bg_lo[i]=0; bg_hi[i]=0; end end
 
 reg [15:0] bg_cpu_rdata;
-wire        bg_we_lo_cpu = bgram_memrq && (wr_lo || wr_w);
-wire        bg_we_hi_cpu = bgram_memrq && (wr_hi || wr_w);
-wire [15:0] bg_wdata_cpu = wr_w ? cpu_dout : {cpu_dout[7:0], cpu_dout[7:0]};
+wire        bg_we_lo_cpu = bgram_memrq && cpu_we_lo;
+wire        bg_we_hi_cpu = bgram_memrq && cpu_we_hi;
+wire [15:0] bg_wdata_cpu = cpu_dout;
 wire [9:0]  bg_idx;
 wire        bg_we_lo, bg_we_hi;
 wire [15:0] bg_wdata_eff;
@@ -102,9 +101,9 @@ assign bg_vram_data = bg_vram_rdata;
 initial begin integer i; for (i=0; i<1024; i=i+1) begin fg_lo[i]=0; fg_hi[i]=0; end end
 
 reg [15:0] fg_cpu_rdata;
-wire        fg_we_lo_cpu = fgram_memrq && (wr_lo || wr_w);
-wire        fg_we_hi_cpu = fgram_memrq && (wr_hi || wr_w);
-wire [15:0] fg_wdata_cpu = wr_w ? cpu_dout : {cpu_dout[7:0], cpu_dout[7:0]};
+wire        fg_we_lo_cpu = fgram_memrq && cpu_we_lo;
+wire        fg_we_hi_cpu = fgram_memrq && cpu_we_hi;
+wire [15:0] fg_wdata_cpu = cpu_dout;
 wire [9:0]  fg_idx;
 wire        fg_we_lo, fg_we_hi;
 wire [15:0] fg_wdata_eff;
@@ -130,9 +129,9 @@ assign fg_vram_data = fg_vram_rdata;
 initial begin integer i; for (i=0; i<2048; i=i+1) begin pal_lo[i]=0; pal_hi[i]=0; end end
 
 reg [15:0] pal_cpu_rdata;
-wire        pal_we_lo_cpu = palette_memrq && (wr_lo || wr_w);
-wire        pal_we_hi_cpu = palette_memrq && (wr_hi || wr_w);
-wire [15:0] pal_wdata_cpu = wr_w ? cpu_dout : {cpu_dout[7:0], cpu_dout[7:0]};
+wire        pal_we_lo_cpu = palette_memrq && cpu_we_lo;
+wire        pal_we_hi_cpu = palette_memrq && cpu_we_hi;
+wire [15:0] pal_wdata_cpu = cpu_dout;
 wire [10:0] pal_idx;
 wire        pal_we_lo, pal_we_hi;
 wire [15:0] pal_wdata_eff;
@@ -161,37 +160,44 @@ assign pal_vram_data = pal_vram_rdata;
 
 // Latch "che ho appena letto" per allineare con BRAM 1-cycle latency
 reg bgram_rd_lat, fgram_rd_lat, palette_rd_lat;
-reg cpu_addr_lo_lat;
 
 always @(posedge clk) begin
 	if (reset) begin
 		bgram_rd_lat    <= 1'b0;
 		fgram_rd_lat    <= 1'b0;
 		palette_rd_lat  <= 1'b0;
-		cpu_addr_lo_lat <= 1'b0;
 	end else begin
 		// Latch decoder ogni ciclo (pattern M72 _valid_lat)
 		bgram_rd_lat    <= cpu_rd & bgram_memrq;
 		fgram_rd_lat    <= cpu_rd & fgram_memrq;
 		palette_rd_lat  <= cpu_rd & palette_memrq;
-		cpu_addr_lo_lat <= cpu_addr[0];
 	end
 end
 
-// Byte align (V30 vuole byte richiesto sempre su [7:0])
-function [15:0] byte_align;
-	input [15:0] data;
-	input        addr_lo;
-	begin
-		byte_align = addr_lo ? {data[7:0], data[15:8]} : data;
-	end
-endfunction
-
+// Core M72 lane-aware: word naturale, il core seleziona il byte (niente byte_align).
 assign DOUT_VALID = bgram_rd_lat | fgram_rd_lat | palette_rd_lat;
 
-assign DOUT = bgram_rd_lat   ? byte_align(bg_cpu_rdata,  cpu_addr_lo_lat) :
-              fgram_rd_lat   ? byte_align(fg_cpu_rdata,  cpu_addr_lo_lat) :
-              palette_rd_lat ? byte_align(pal_cpu_rdata, cpu_addr_lo_lat) :
+assign DOUT = bgram_rd_lat   ? bg_cpu_rdata  :
+              fgram_rd_lat   ? fg_cpu_rdata  :
+              palette_rd_lat ? pal_cpu_rdata :
               16'h0000;
+
+`ifdef V30_SIM_PROBES
+// Probe PALETTE: quale REGIONE contiene il colore del blocco scuro?
+// regione 0x000=BG 0x100=FG 0x200=SPR 0x300=TXT -> identifica il layer colpevole.
+integer pal_i;
+integer pal_scan_cnt = 0;
+reg pal_scanned = 1'b0;
+always @(posedge clk) begin
+	pal_scan_cnt <= pal_scan_cnt + 1;
+	if (!pal_scanned && pal_scan_cnt == 32'd60000000) begin
+		pal_scanned <= 1'b1;
+		for (pal_i = 0; pal_i < 1024; pal_i = pal_i + 1)
+			if ({pal_hi[pal_i], pal_lo[pal_i]} == 16'h0243)
+				$display("[palhit] idx=%03h regione=%0h", pal_i[10:0], pal_i[9:8]);
+		$display("[palhit] scan completa");
+	end
+end
+`endif
 
 endmodule

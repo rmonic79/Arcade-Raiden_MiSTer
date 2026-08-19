@@ -3,6 +3,5 @@ set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_freqinfo.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_bcd_cnt.v
 set_global_assignment -name VERILOG_FILE rtl/pll.v
 set_global_assignment -name QIP_FILE rtl/pll.qip
-# Savestate (wickerwaka ssbus + WonderSwan V30 bridge)
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/raiden_v30_ss.sv
+# Savestate (wickerwaka ssbus)
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/raiden_ss_manager.sv

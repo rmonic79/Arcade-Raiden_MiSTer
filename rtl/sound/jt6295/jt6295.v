@@ -29,6 +29,8 @@ module jt6295(
     output        [17:0]   rom_addr,
     input         [ 7:0]   rom_data,
     input                  rom_ok,
+    // Per-channel volume (Q4.4, 0x10=1.0x = default unita')
+    input         [ 7:0]   chvol0, chvol1, chvol2, chvol3,
     // Sound output
     output signed [13:0]   sound,
     output                 sample   // 48 kHz for a 1.000 MHz cen
@@ -48,6 +50,7 @@ wire        cen_sr32, // 32x sampling rate
             cen_eff;  // effective sound sampling rate after optional interpolator
 
 wire [ 3:0] busy, ack, start, stop;
+wire [ 3:0] pending;   // [Raiden] comando latchato ma non ancora avviato
 wire [17:0] start_addr, stop_addr ,
             ch_addr;
 wire [ 9:0] ctrl_addr;
@@ -58,7 +61,9 @@ wire        ctrl_ok, ctrl_cs, zero;
 wire        pipe_en;
 wire signed [11:0] pipe_snd;
 
-assign dout   = { 4'hf, busy | start };
+// [Raiden 2026-08-14] +pending: lo stato deve dire OCCUPATO gia' dal 2o byte
+// del comando, come il chip reale/MAME. Vedi jt6295_ctrl.pending.
+assign dout   = { 4'hf, busy | start | pending };
 assign sample = SAMPLE==0 ? cen_48k : cen_eff;
 
 jt6295_timing u_timing(
@@ -114,6 +119,7 @@ jt6295_ctrl u_ctrl(
     .rom_ok     ( ctrl_ok       ),
 
     .start      ( start         ),
+    .pending    ( pending       ),
     .stop       ( stop          ),
     .busy       ( busy          ),
     .ack        ( ack           ),
@@ -161,6 +167,10 @@ jt6295_acc #(.INTERPOL(INTERPOL)) u_acc(
     .cen4       ( cen_sr4       ),
     // serialized data
     .sound_in   ( pipe_snd      ),
+    .chvol0     ( chvol0        ),
+    .chvol1     ( chvol1        ),
+    .chvol2     ( chvol2        ),
+    .chvol3     ( chvol3        ),
     .sound_out  ( sound         ),
     .sample     ( cen_eff       )
 );

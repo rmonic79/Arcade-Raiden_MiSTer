@@ -24,6 +24,7 @@ module jt6295_acc(
     input                cen,
     input                cen4,
     input  signed [11:0] sound_in,
+    input        [ 7:0]  chvol0, chvol1, chvol2, chvol3, // Q4.4 per-canale (0x10=1.0x default)
     output signed [13:0] sound_out,
     output               sample
 );
@@ -37,11 +38,31 @@ parameter INTERPOL=0; // 0 = no interpolator (recommended if there's already)
 
 reg signed [13:0] acc, sum;
 
+// slot-tracking canale (0..3): cen marca ch0, poi +1 a ogni cen4
+reg [1:0] slot = 2'd0;
+always @(posedge clk, posedge rst)
+    if(rst)       slot <= 2'd0;
+    else if(cen4) slot <= cen ? 2'd1 : slot + 2'd1;
+
+reg [7:0] gsel;
+always @(*) case(slot)
+    2'd0:    gsel = chvol0;
+    2'd1:    gsel = chvol1;
+    2'd2:    gsel = chvol2;
+    2'd3:    gsel = chvol3;
+    default: gsel = chvol0;
+endcase
+
+// gain per-canale Q4.4 con clamp a 12-bit (no overflow su acc 14-bit: 4x2047<8191)
+wire signed [16:0] sg      = (sound_in * $signed({1'b0, gsel})) >>> 4;
+wire signed [11:0] sound_g = (sg >  17'sd2047) ?  12'sd2047 :
+                             (sg < -17'sd2048) ? -12'sd2048 : sg[11:0];
+
 always @(posedge clk, posedge rst) begin
     if( rst ) begin
         acc <= 14'd0;
     end else if(cen4) begin
-        acc <= cen ? sound_in : acc + sound_in;
+        acc <= cen ? sound_g : acc + sound_g;
     end
 end
 
@@ -68,7 +89,7 @@ generate
             if( rst )
                 fir_din <= 16'd0;
             else
-                if( cen4 ) fir_din <= cen ? { {1{sum[13]}}, sum, 1'b0 } : 16'd0;
+                if( cen4 ) fir_din <= cen ? { sum, 2'b0 } : 16'd0; // x4 (era x2): compensa interpolazione 4x, +6dB
         end
 
 

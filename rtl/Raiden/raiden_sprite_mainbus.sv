@@ -45,10 +45,9 @@ module raiden_sprite_mainbus #(parameter SS_IDX = -1)
 // Word index (4KB / 2 byte = 2K word)
 wire [10:0] spr_word_addr = cpu_addr[11:1];
 
-// Byte enable
-wire wr_lo = cpu_wr && cpu_be[0] && !cpu_be[1] && !cpu_addr[0];
-wire wr_hi = cpu_wr && cpu_be[0] && !cpu_be[1] &&  cpu_addr[0];
-wire wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
+// M72-native byte lanes: cpu_be[0]=lane bassa, cpu_be[1]=lane alta; cpu_dout già allineato.
+wire cpu_we_lo = cpu_wr && cpu_be[0];
+wire cpu_we_hi = cpu_wr && cpu_be[1];
 
 // ─── Sprite RAM CPU bank ────────────────────────────────────────────────
 (* ramstyle = "M10K,no_rw_check" *) reg [7:0] spr_lo [0:2047];
@@ -56,9 +55,9 @@ wire wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
 initial begin integer i; for (i=0; i<2048; i=i+1) begin spr_lo[i]=0; spr_hi[i]=0; end end
 
 reg [15:0] spr_cpu_rdata;
-wire        spr_we_lo_cpu = sprite_memrq && (wr_lo || wr_w);
-wire        spr_we_hi_cpu = sprite_memrq && (wr_hi || wr_w);
-wire [15:0] spr_wdata_cpu = wr_w ? cpu_dout : {cpu_dout[7:0], cpu_dout[7:0]};
+wire        spr_we_lo_cpu = sprite_memrq && cpu_we_lo;
+wire        spr_we_hi_cpu = sprite_memrq && cpu_we_hi;
+wire [15:0] spr_wdata_cpu = cpu_dout;
 wire [10:0] spr_idx;
 wire        spr_we_lo, spr_we_hi;
 wire [15:0] spr_wdata_eff;
@@ -117,19 +116,17 @@ assign spr_vram_data = spr_vram_rdata;
 
 // ─── DOUT_VALID + DOUT (pattern M72) ────────────────────────────────────
 reg sprite_rd_lat;
-reg cpu_addr_lo_lat;
 
 always @(posedge clk) begin
 	if (reset) begin
 		sprite_rd_lat   <= 1'b0;
-		cpu_addr_lo_lat <= 1'b0;
 	end else begin
 		sprite_rd_lat   <= cpu_rd & sprite_memrq;
-		cpu_addr_lo_lat <= cpu_addr[0];
 	end
 end
 
+// Core M72 lane-aware: word naturale, il core seleziona il byte (niente swap).
 assign DOUT_VALID = sprite_rd_lat;
-assign DOUT       = cpu_addr_lo_lat ? {spr_cpu_rdata[7:0], spr_cpu_rdata[15:8]} : spr_cpu_rdata;
+assign DOUT       = spr_cpu_rdata;
 
 endmodule

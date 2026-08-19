@@ -48,9 +48,19 @@ set_global_assignment -name ECO_OPTIMIZE_TIMING ON
 set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION ON
 set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
 set_global_assignment -name ALM_REGISTER_PACKING_EFFORT MEDIUM
-set_global_assignment -name SEED 1
+set_global_assignment -name SEED 5
 
 set_global_assignment -name VERILOG_MACRO "USE_FX68K_CORE=1"
+# Richiesto dall'ucore (nec_test.qsf:60): Quartus 17 NON definisce SYNTHESIS da
+# solo; senza, i blocchi sim-only ($test$plusargs ecc.) rompono la synthesis e
+# HEXDIR del microcode punterebbe al path sbagliato.
+set_global_assignment -name VERILOG_MACRO "SYNTHESIS=1"
+# ucore wickerwaka: usiamo il BUS DE-MUXATO (landing b7083b4), quindi
+# V30_MUXED_AD NON va definita. Cosi' il core non ha ne' AD/AD_OE (pad muxati
+# da emulare) ne' CE_HALF/t1_half2: l'adattatore prende l'indirizzo da ADDR_O,
+# il dato scritto da DATA_O e restituisce il dato letto su DATA_I.
+# Conseguenza voluta: sparisce l'arco cross-phase ce->t1_half2, che a 80 MHz
+# non chiudeva (misurato -6.856 ns) e che l'SDC poteva solo mascherare.
 
 set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 
@@ -78,7 +88,6 @@ set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
 source sys/sys.tcl
 source sys/sys_analog.tcl
 source files.qip
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/raiden_v30_ss.sv
 # === AUDIO ===
 # Audio Seibu reale: Z80 (T80) + YM3812 (jtopl2) + OKI6295 (jt6295)
 # ROM Z80 da MRA @ ioctl_addr 0x4E0000 (32KB)
@@ -96,6 +105,7 @@ set_global_assignment -name VERILOG_FILE rtl/sound/jtframe_fir_mono.v
 set_global_assignment -name VERILOG_FILE rtl/sound/jtframe_dual_ram.v
 set_global_assignment -name QIP_FILE rtl/sound/jt6295/jt6295.qip
 set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
+set_global_assignment -name POST_FLOW_SCRIPT_FILE "quartus_sh:sys/post_flow_rbf_date.tcl"
 set_location_assignment PIN_U9 -to ADC_CONVST
 set_location_assignment PIN_V10 -to ADC_SCK
 set_location_assignment PIN_AC4 -to ADC_SDI
@@ -292,16 +302,20 @@ set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_68kdtack_cen.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_freqinfo.v
 set_global_assignment -name VERILOG_FILE rtl/jtframe/jtframe_bcd_cnt.v
 set_global_assignment -name VERILOG_FILE rtl/pll.v
-# V30 NEC CPU (porting da MiSTer-devel/WonderSwan_MiSTer, VHDL-2008).
-# Ordine compile: pacchetti prima (export, registerpackage, bus_savestates,
-# reg_savestates), poi entity divider, poi cpu (che le usa tutte).
-set_global_assignment -name VHDL_INPUT_VERSION VHDL_2008
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/export.vhd
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/registerpackage.vhd
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/bus_savestates.vhd
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/reg_savestates.vhd
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/divider.vhd
-set_global_assignment -name VHDL_FILE rtl/Raiden/v30/cpu.vhd
+# V30 NEC CPU — core cycle-accurate SystemVerilog (wickerwaka, da Arcade-IremM72).
+# Ordine compile: package v30_ss_pkg PRIMA, poi biu/eu/core/bus.
+# -- V30 UCORE (nec_test, cycle-exact vs chip reale) al posto del core FSM --
+# Package stesso nome (v30_ss_pkg), porte v30_core IDENTICHE -> drop-in.
+# HEXDIR default synthesis = rtl/ucore/ (relativo alla project dir) = qui.
+# Gli .svh dell'ucore si risolvono via SEARCH_PATH rtl/ucore.
+set_global_assignment -name SEARCH_PATH rtl/ucore
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ucore/v30u_ss_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ucore/v30_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ucore/v30u_biu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ucore/v30u_ucrom.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/ucore/v30u_eu.sv
+set_global_assignment -name SEARCH_PATH rtl/Raiden/v30_new
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/v30_new/v30_bus.sv
 # Wrapper SV: adatta interfaccia cpu (bus_addr/bus_read/bus_write/bus_be) a
 # Raiden_main_top (cpu_addr/din/dout/rd/wr/be). Tied-off savestate/DMA.
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/v30/cpu_v30_bridge.sv
@@ -370,3 +384,5 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to SDIO_DAT[*]
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to SD_SPI*
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to USER_IO[*]
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
+
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Raiden/raiden_ss_manager.sv

@@ -15,6 +15,7 @@
     along with Raiden_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
 
     Author: Umberto Parisi (rmonic79)
+    Version: 1.0
     Date: 2026
 
 */
@@ -185,7 +186,7 @@ wire [1:0] patron_tier;
 pause_text #(
 	.W_CHARS       (30),
 	.H_CHARS       (24),
-	.MSG_ROWS      (73),
+	.MSG_ROWS      (72),
 	.ORIGIN_X      (10'd0),     // frame reale 224: patron e' 240px (>224), ORIGIN_X=0 = padding sx minimo
 	.ORIGIN_Y      (9'd32),     // sotto header
 	.SCROLL_EN     (1),
